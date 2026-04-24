@@ -45,38 +45,22 @@ If you want it to auto-start at login too:
 ./install_pi_launchers.sh --autostart
 ```
 
-## 1. Run the server with systemd
+## 1. Start switch control on boot
 
-Example service file:
-
-```ini
-[Unit]
-Description=Time Volume actuator server
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/pi/volumetric_time_camera
-ExecStart=/usr/bin/python3 /home/pi/volumetric_time_camera/actuator_web.py --host 0.0.0.0 --port 8000
-Restart=always
-User=pi
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Save as:
-
-```text
-/etc/systemd/system/time-volume.service
-```
-
-Then run:
+The physical switch is polled by `actuator_web.py`. To make that available as
+soon as the Pi has booted, install the systemd service from the project folder:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now time-volume.service
+chmod +x install_boot_service.sh
+sudo ./install_boot_service.sh
 ```
+
+This starts the actuator server before the desktop session. It is still limited
+by Pi/Linux boot time; if the lift must respond the instant power is applied,
+use a hardware manual control path or a dedicated motor controller.
+
+The boot service uses required GPIO mode, so it will retry through systemd
+instead of quietly running without switch/motor access.
 
 ## 2. Auto-launch the fullscreen monitor output
 

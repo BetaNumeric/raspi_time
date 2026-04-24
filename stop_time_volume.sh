@@ -23,4 +23,13 @@ stop_pid_file() {
 stop_pid_file "$BROWSER_PID_FILE"
 stop_pid_file "$PID_FILE"
 
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet time-volume.service 2>/dev/null; then
+    if systemctl stop time-volume.service 2>/dev/null; then
+        echo "Stopped time-volume.service."
+    else
+        echo "time-volume.service is still running. To stop boot-managed switch control, run:"
+        echo "  sudo systemctl stop time-volume.service"
+    fi
+fi
+
 echo "Time Volume stopped."

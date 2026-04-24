@@ -1404,12 +1404,15 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         print(message, end="")
 
 
-def request_gpio_lines() -> Any:
+def request_gpio_lines(require_gpio: bool = False) -> Any:
     output_offsets = (RPWM, LPWM, REN, LEN)
     input_offsets = (SW_EXTEND_IN, SW_RETRACT_IN)
 
     if gpiod is None:
-        print("Warning: gpiod is unavailable. Running in simulation mode.")
+        message = "gpiod is unavailable"
+        if require_gpio:
+            raise RuntimeError(message)
+        print(f"Warning: {message}. Running in simulation mode.")
         return None
 
     try:
@@ -1428,7 +1431,10 @@ def request_gpio_lines() -> Any:
             },
         )
     except Exception as exc:
-        print(f"Warning: Could not open GPIO. Running in simulation mode. ({exc})")
+        message = f"Could not open GPIO ({exc})"
+        if require_gpio:
+            raise RuntimeError(message) from exc
+        print(f"Warning: {message}. Running in simulation mode.")
         return None
 
 
@@ -1438,6 +1444,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"HTTP bind host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP bind port (default: {DEFAULT_PORT})")
+    parser.add_argument("--require-gpio", action="store_true", help="Exit instead of running in simulation mode if GPIO is unavailable")
     return parser
 
 
@@ -1460,7 +1467,7 @@ def main() -> None:
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
     WEB_DIR.mkdir(parents=True, exist_ok=True)
 
-    req = request_gpio_lines()
+    req = request_gpio_lines(require_gpio=args.require_gpio)
     controller = InstallationController(req)
     ActuatorRequestHandler.controller = controller
     server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)

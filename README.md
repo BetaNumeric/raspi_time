@@ -9,7 +9,7 @@ The active runtime is the web stack:
 - `web/display.html` is the fullscreen monitor output shown on the lift.
 - `index.html`, `manifest.json`, `service-worker.js`, and `icons/` are the long-exposure camera PWA served at `/camera/`.
 - `media/` contains image sequences and video clips used by the display.
-- `start_time_volume.sh`, `stop_time_volume.sh`, and `install_pi_launchers.sh` are Raspberry Pi launch helpers.
+- `start_time_volume.sh`, `stop_time_volume.sh`, `install_pi_launchers.sh`, and `install_boot_service.sh` are Raspberry Pi launch helpers.
 
 ## Run
 
@@ -32,6 +32,25 @@ For the Pi kiosk flow, run:
 ```bash
 ./start_time_volume.sh
 ```
+
+## Boot Switch Control
+
+The physical switch is handled by `actuator_web.py`, so it works whenever the
+server process is running. To start that process automatically on boot:
+
+```bash
+chmod +x install_boot_service.sh
+sudo ./install_boot_service.sh
+```
+
+This makes basic switch control available shortly after Linux finishes booting,
+even before the desktop display opens. It cannot respond at the exact instant
+the Pi receives power; for truly immediate movement, wire a hardware manual
+control path or a dedicated motor controller that does not depend on the Pi
+booting first.
+
+The boot service requires GPIO access. If GPIO is unavailable, systemd will keep
+retrying instead of starting in simulation mode.
 
 ## Runtime Files
 

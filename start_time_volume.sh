@@ -25,7 +25,24 @@ find_browser() {
     return 1
 }
 
+server_is_healthy() {
+    python3 - "$HEALTH_URL" <<'PY'
+import sys
+import urllib.request
+
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=1.5) as response:
+        raise SystemExit(0 if response.status == 200 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 start_server() {
+    if server_is_healthy; then
+        return 0
+    fi
+
     if [[ -f "$PID_FILE" ]]; then
         local existing_pid
         existing_pid="$(cat "$PID_FILE" 2>/dev/null || true)"

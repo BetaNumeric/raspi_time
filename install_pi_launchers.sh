@@ -13,7 +13,7 @@ fi
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$AUTOSTART_DIR"
 
-chmod +x "$SCRIPT_DIR/start_time_volume.sh" "$SCRIPT_DIR/stop_time_volume.sh"
+chmod +x "$SCRIPT_DIR/start_time_volume.sh" "$SCRIPT_DIR/stop_time_volume.sh" "$SCRIPT_DIR/install_boot_service.sh"
 
 cat > "$DESKTOP_DIR/Start Time Volume.desktop" <<EOF
 [Desktop Entry]
