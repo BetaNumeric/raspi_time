@@ -1304,14 +1304,17 @@
         }
 
         async function refreshStateLoop() {
+            let nextPollMs = 1000;
             try {
                 const state = await apiGet("/api/state");
                 await applyState(state);
+                nextPollMs = state.is_moving || state.is_cycling || state.countdown_remaining > 0 || state.switch_direction !== 0 ? 300 : 1000;
             } catch (error) {
                 modePill.textContent = "Offline";
                 countdownPill.textContent = "Retrying";
+                nextPollMs = 1500;
             } finally {
-                setTimeout(refreshStateLoop, 300);
+                setTimeout(refreshStateLoop, nextPollMs);
             }
         }
 

@@ -34,6 +34,11 @@ on the Pi desktop. Clicking `Start Time Volume.desktop` will:
 
 The same server also hosts the phone controller and camera app.
 
+Camera access from a phone/tablet browser generally needs HTTPS unless the page
+is opened on `localhost`. If `/camera/` loads but camera initialization fails
+over `http://<pi-address>:8000`, put the Pi behind HTTPS or a trusted local
+tunnel for the camera app.
+
 If you want it to auto-start at login too:
 
 ```bash

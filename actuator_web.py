@@ -66,7 +66,7 @@ class SequenceItem:
     kind: str
     relative_path: str
     frame_count: int = 0
-    frame_urls: list[str] = field(default_factory=list)
+    frame_paths: list[str] = field(default_factory=list)
     media_url: str | None = None
 
     def frame_index_for_pct(self, position_pct: float) -> int:
@@ -87,7 +87,7 @@ class SequenceItem:
 
     def detail(self) -> dict[str, Any]:
         payload = self.summary()
-        payload["frame_urls"] = self.frame_urls
+        payload["frame_urls"] = [media_url_for(path) for path in self.frame_paths]
         return payload
 
 
@@ -104,44 +104,41 @@ class SequenceLibrary:
         root_resolved = self.root.resolve()
         items: dict[str, SequenceItem] = {}
 
-        for file_path in sorted(self.root.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
-                continue
-            rel_path = file_path.relative_to(self.root).as_posix()
-            items[rel_path] = SequenceItem(
-                id=rel_path,
-                name=file_path.stem,
-                kind="video",
-                relative_path=rel_path,
-                media_url=media_url_for(rel_path),
-            )
-
-        for current_dir, _, filenames in os.walk(self.root):
-            image_names = [
-                name
-                for name in sorted(filenames)
-                if Path(name).suffix.lower() in IMAGE_EXTENSIONS
-            ]
-            if not image_names:
-                continue
-
+        for current_dir, dirnames, filenames in os.walk(self.root):
+            dirnames.sort()
             directory = Path(current_dir)
-            rel_dir = directory.resolve().relative_to(root_resolved).as_posix()
+            directory_resolved = directory.resolve()
+            rel_dir = "" if directory_resolved == root_resolved else directory_resolved.relative_to(root_resolved).as_posix()
+            image_paths: list[str] = []
+
+            for name in sorted(filenames):
+                file_path = directory / name
+                suffix = file_path.suffix.lower()
+                rel_path = file_path.relative_to(self.root).as_posix()
+
+                if suffix in VIDEO_EXTENSIONS:
+                    items[rel_path] = SequenceItem(
+                        id=rel_path,
+                        name=file_path.stem,
+                        kind="video",
+                        relative_path=rel_path,
+                        media_url=media_url_for(rel_path),
+                    )
+                elif suffix in IMAGE_EXTENSIONS:
+                    image_paths.append(rel_path)
+
+            if not image_paths:
+                continue
+
             sequence_id = rel_dir or "__root__"
             display_name = directory.name if rel_dir else "media"
-            frame_urls = [
-                media_url_for((directory / image_name).relative_to(self.root).as_posix())
-                for image_name in image_names
-            ]
             items[sequence_id] = SequenceItem(
                 id=sequence_id,
                 name=display_name,
                 kind="images",
                 relative_path=rel_dir or ".",
-                frame_count=len(frame_urls),
-                frame_urls=frame_urls,
+                frame_count=len(image_paths),
+                frame_paths=image_paths,
             )
 
         order = sorted(
@@ -1387,6 +1384,18 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        path = urlparse(self.path).path
+        status = None
+        if len(args) > 1:
+            try:
+                status = int(args[1])
+            except (TypeError, ValueError):
+                status = None
+
+        if status is not None and 200 <= status < 400:
+            if path == "/api/state" or path.startswith("/media/"):
+                return
+
         message = "%s - - [%s] %s\n" % (
             self.address_string(),
             self.log_date_time_string(),

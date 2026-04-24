@@ -23,6 +23,10 @@ Then open:
 - Display: `http://127.0.0.1:8000/display`
 - Camera: `http://<pi-address>:8000/camera/`
 
+Camera access from phones/tablets usually requires HTTPS, except on `localhost`.
+If the camera PWA opens but cannot initialize the camera over a Pi LAN address,
+serve the app through HTTPS or a trusted local tunnel.
+
 For the Pi kiosk flow, run:
 
 ```bash
@@ -39,8 +43,8 @@ These are generated while the installation runs and should not be treated as sou
 - `*.log`
 - `*.tmp`
 
-## Archive Candidates
-
-`actuator_gui.py` appears to be the older Tkinter/OpenCV control station. It is useful reference code, but the web stack is the cleaner production path because it separates the Pi display, remote controller, API, and camera app. If you confirm the Tkinter GUI is no longer used, move it to an `archive/` or `legacy/` folder in a follow-up cleanup.
+## Cleanup Notes
 
 The `media/` folder is intentionally large. Keep active sequences there, but move retired frame sets outside the repo or into a clearly named external archive to keep deploys and backups manageable.
+
+The old Tkinter/OpenCV control station has been archived outside the active runtime. The production path is `actuator_web.py` plus the web apps listed above.
