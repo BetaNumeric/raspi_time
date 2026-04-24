@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.codex
+
+.run/
+*.log
+*.tmp
+actuator_state.json
+
+.DS_Store
+Thumbs.db
+*.desktop
+media/

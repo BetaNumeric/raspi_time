@@ -1,0 +1,934 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#000000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Time Volume">
+    <meta name="description" content="Long-exposure camera interface for the Time Volume installation.">
+    <link rel="manifest" href="./manifest.json">
+    <link rel="icon" type="image/png" sizes="32x32" href="./icons/icon_32.png">
+    <link rel="apple-touch-icon" href="./icons/icon_192.png">
+    <title>Time Volume Camera</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #000;
+            margin: 0;
+            overflow: hidden;
+            color: white;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
+        }
+        canvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+        #reviewImage {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            display: none;
+            touch-action: auto;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: default;
+            -webkit-user-drag: none;
+        }
+        .active-ring {
+            position: absolute;
+            inset: -8px;
+            border: 2px solid rgba(220, 38, 38, 0.5);
+            border-radius: 9999px;
+            animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+        }
+        @keyframes ping {
+            75%, 100% { transform: scale(1.4); opacity: 0; }
+        }
+        #sourceVideo {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .control-icon {
+            width: 24px;
+            height: 24px;
+            object-fit: contain;
+            display: block;
+            filter: brightness(0) saturate(100%) invert(43%) sepia(6%) saturate(329%) hue-rotate(183deg) brightness(94%) contrast(86%);
+        }
+        .overlay-icon {
+            width: 20px;
+            height: 20px;
+            object-fit: contain;
+            display: block;
+            filter: brightness(0) saturate(100%) invert(100%);
+        }
+        .settings-scroll {
+            position: absolute;
+            inset: 0;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            touch-action: pan-y;
+            padding-top: max(5rem, calc(env(safe-area-inset-top) + 1.5rem));
+            padding-right: 1.5rem;
+            padding-bottom: max(2rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+            padding-left: 1.5rem;
+        }
+        .settings-card {
+            position: relative;
+            max-width: 24rem;
+            margin: 0 auto;
+        }
+    </style>
+</head>
+<body class="fixed inset-0 flex flex-col items-center">
+
+    <!-- Viewport Area -->
+    <div id="viewport" class="relative flex-1 w-full flex items-center justify-center bg-neutral-950 overflow-hidden">
+        
+        <!-- User Gesture Required Overlay -->
+        <div id="startOverlay" class="absolute inset-0 flex flex-col items-center justify-center space-y-6 z-50 bg-black">
+            <div class="w-20 h-20 bg-white/10 rounded-full flex items-center justify-center">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            </div>
+            <div class="text-center px-6">
+                <h1 class="text-xl font-bold tracking-widest uppercase mb-2">Time Volume</h1>
+                <p class="text-xs text-neutral-500 uppercase tracking-widest mb-8">Long Exposure Interface</p>
+                <button id="initBtn" class="px-12 py-4 bg-white text-black rounded-full font-black uppercase tracking-tighter active:scale-95 transition-transform">
+                    Initialize System
+                </button>
+            </div>
+        </div>
+
+        <!-- Error State -->
+        <div id="error-view" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-black p-8 text-center z-50">
+            <div class="text-red-500 text-5xl mb-4">⚠️</div>
+            <h2 class="text-2xl font-bold">Hardware Connection Failed</h2>
+            <p id="error-msg" class="text-neutral-400 mt-4 max-w-xs text-sm">Could not access camera.</p>
+            <button onclick="window.location.reload()" class="mt-8 px-8 py-3 bg-neutral-800 text-white rounded-full font-bold uppercase tracking-wider text-xs">
+                Tap to Retry
+            </button>
+        </div>
+        
+        <!-- Main Stack Canvas -->
+        <canvas id="stackCanvas"></canvas>
+        <img id="reviewImage" class="hidden" alt="Captured long exposure" draggable="false">
+
+        <!-- Recording HUD -->
+        <div id="hud" class="hidden absolute top-8 left-8 flex items-center space-x-3 bg-red-600 px-5 py-2.5 rounded-full animate-pulse shadow-2xl z-20">
+            <div class="w-3 h-3 bg-white rounded-full"></div>
+            <span class="text-xs font-black uppercase tracking-[0.2em]">Recording</span>
+        </div>
+
+        <button id="settingsBtn" class="absolute top-6 left-6 w-12 h-12 rounded-full bg-black/80 border border-white/10 text-white shadow-2xl z-20 flex items-center justify-center active:scale-95 transition-transform" aria-label="Open settings">
+            <img src="./icons/settings.png" alt="" class="overlay-icon" draggable="false">
+        </button>
+
+        <button id="closePreviewBtn" class="hidden absolute top-6 right-6 w-12 h-12 rounded-full bg-black/80 border border-white/10 text-white shadow-2xl z-20 flex items-center justify-center active:scale-95 transition-transform" aria-label="Close result and return to preview">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <path d="M6 6l12 12"></path>
+                <path d="M18 6L6 18"></path>
+            </svg>
+        </button>
+
+        <div id="settingsPanel" class="hidden fixed inset-0 z-50">
+            <button id="settingsBackdrop" class="absolute inset-0 bg-black/70" aria-label="Close settings"></button>
+            <div class="settings-scroll">
+                <div class="settings-card rounded-3xl border border-white/10 bg-neutral-950/95 backdrop-blur-md shadow-2xl p-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h2 class="text-sm font-black uppercase tracking-[0.2em] text-white">Settings</h2>
+                        <button id="closeSettingsBtn" class="w-10 h-10 rounded-full bg-white/5 border border-white/10 flex items-center justify-center active:scale-95 transition-transform" aria-label="Close settings">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                                <path d="M6 6l12 12"></path>
+                                <path d="M18 6L6 18"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="space-y-4">
+                        <label class="block rounded-2xl border border-white/5 bg-white/[0.03] p-4">
+                            <div class="flex items-center justify-between gap-4">
+                                <span class="text-[11px] font-black uppercase tracking-[0.18em] text-white">Blend</span>
+                                <span id="stackBlendModeValue" class="text-[11px] uppercase tracking-[0.18em] text-neutral-400">Brightest</span>
+                            </div>
+                            <select id="stackBlendModeSelect" class="mt-3 w-full rounded-2xl border border-white/10 bg-black/60 px-4 py-3 text-sm text-white outline-none">
+                                <option value="lighten">Brightest</option>
+                                <option value="mean">Mean</option>
+                                <option value="median">Median</option>
+                            </select>
+                        </label>
+
+                        <label id="stackOpacityField" class="block rounded-2xl border border-white/5 bg-white/[0.03] p-4">
+                            <div class="flex items-center justify-between gap-4">
+                                <span class="text-[11px] font-black uppercase tracking-[0.18em] text-white">Strength</span>
+                                <span id="stackOpacityValue" class="text-[11px] uppercase tracking-[0.18em] text-neutral-400">100%</span>
+                            </div>
+                            <input id="stackOpacitySlider" type="range" min="5" max="100" step="1" value="100" class="mt-3 w-full accent-white">
+                        </label>
+
+                        <label id="medianFrameCountField" class="hidden block rounded-2xl border border-white/5 bg-white/[0.03] p-4">
+                            <div class="flex items-center justify-between gap-4">
+                                <span class="text-[11px] font-black uppercase tracking-[0.18em] text-white">Median Frames</span>
+                                <span id="medianFrameCountValue" class="text-[11px] uppercase tracking-[0.18em] text-neutral-400">3</span>
+                            </div>
+                            <input id="medianFrameCountSlider" type="range" min="3" max="7" step="2" value="3" class="mt-3 w-full accent-white">
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="w-full bg-neutral-950 p-8 flex items-center justify-between border-t border-white/5 pb-14 z-30 max-w-3xl mx-auto">
+        
+        <button id="resetBtn" class="group flex flex-col items-center space-y-2 active:scale-90 transition-transform">
+            <div class="p-5 rounded-2xl bg-neutral-900 text-neutral-500 border border-white/5">
+                <img src="./icons/delete.png" alt="" class="control-icon" draggable="false">
+            </div>
+            <span class="text-[9px] uppercase tracking-widest font-bold text-neutral-600">Clear</span>
+        </button>
+
+        <div class="relative">
+            <div id="pingRing" class="hidden active-ring"></div>
+            <button id="triggerBtn" class="p-12 rounded-full bg-white text-black shadow-xl relative z-10 active:scale-95 transition-all">
+                <div id="iconPlay">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                </div>
+                <div id="iconStop" class="hidden">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                </div>
+            </button>
+        </div>
+
+        <button id="saveBtn" class="group flex flex-col items-center space-y-2 active:scale-90 transition-transform">
+            <div class="p-5 rounded-2xl bg-neutral-900 text-neutral-500 border border-white/5">
+                <img src="./icons/download.png" alt="" class="control-icon" draggable="false">
+            </div>
+            <span class="text-[9px] uppercase tracking-widest font-bold text-neutral-600">Save JPG</span>
+        </button>
+    </div>
+
+    <!-- Hidden Video and Buffer -->
+    <video id="sourceVideo" autoplay playsinline muted></video>
+    <canvas id="bufferCanvas" style="display:none;"></canvas>
+    <canvas id="blendCanvas" style="display:none;"></canvas>
+
+    <div class="absolute bottom-4 text-[9px] text-neutral-700 uppercase tracking-[0.4em] w-full text-center pointer-events-none font-bold">
+        Luminous Sculpture Interface v1.4
+    </div>
+
+    <script>
+        const STATES = {
+            IDLE: 'idle',
+            PREVIEW: 'preview',
+            CAPTURING: 'capturing',
+            REVIEW: 'review'
+        };
+
+        const video = document.getElementById('sourceVideo');
+        const canvas = document.getElementById('stackCanvas');
+        const reviewImage = document.getElementById('reviewImage');
+        const ctx = canvas.getContext('2d', { alpha: false });
+
+        // Secondary canvas to fix iOS lighten issues
+        const bufferCanvas = document.getElementById('bufferCanvas');
+        const bufferCtx = bufferCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+        const blendCanvas = document.getElementById('blendCanvas');
+        const blendCtx = blendCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+
+        const initBtn = document.getElementById('initBtn');
+        const startOverlay = document.getElementById('startOverlay');
+        const triggerBtn = document.getElementById('triggerBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const settingsBtn = document.getElementById('settingsBtn');
+        const settingsPanel = document.getElementById('settingsPanel');
+        const settingsBackdrop = document.getElementById('settingsBackdrop');
+        const closeSettingsBtn = document.getElementById('closeSettingsBtn');
+        const stackBlendModeSelect = document.getElementById('stackBlendModeSelect');
+        const stackBlendModeValue = document.getElementById('stackBlendModeValue');
+        const stackOpacityField = document.getElementById('stackOpacityField');
+        const stackOpacitySlider = document.getElementById('stackOpacitySlider');
+        const stackOpacityValue = document.getElementById('stackOpacityValue');
+        const medianFrameCountField = document.getElementById('medianFrameCountField');
+        const medianFrameCountSlider = document.getElementById('medianFrameCountSlider');
+        const medianFrameCountValue = document.getElementById('medianFrameCountValue');
+        const closePreviewBtn = document.getElementById('closePreviewBtn');
+        const saveBtn = document.getElementById('saveBtn');
+        const hud = document.getElementById('hud');
+        const errorView = document.getElementById('error-view');
+        const errorMsg = document.getElementById('error-msg');
+        const iconPlay = document.getElementById('iconPlay');
+        const iconStop = document.getElementById('iconStop');
+        const pingRing = document.getElementById('pingRing');
+
+        const cameraProfiles = [
+            {
+                video: {
+                    facingMode: { ideal: 'environment' },
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 }
+                },
+                audio: false
+            },
+            {
+                video: {
+                    facingMode: { ideal: 'environment' }
+                },
+                audio: false
+            },
+            {
+                video: true,
+                audio: false
+            }
+        ];
+
+        let captureState = STATES.IDLE;
+        let mediaStream = null;
+        let animationFrameId = 0;
+        let isStarting = false;
+        let reviewImageUrl = null;
+        const supportsCaptureSharing = typeof navigator.share === 'function' && typeof navigator.canShare === 'function' && typeof File === 'function';
+        const STACK_BLEND_MODES = {
+            lighten: {
+                label: 'Brightest',
+                composite: 'lighten',
+                opacity: 1,
+                processor: 'raw'
+            },
+            mean: {
+                label: 'Mean',
+                composite: 'source-over',
+                opacity: 1,
+                processor: 'mean'
+            },
+            median: {
+                label: 'Median',
+                composite: 'lighten',
+                opacity: 1,
+                processor: 'median'
+            }
+        };
+        let stackBlendModeKey = 'lighten';
+        let stackBlendMode = STACK_BLEND_MODES.lighten.composite;
+        let stackFrameOpacity = STACK_BLEND_MODES.lighten.opacity;
+        let stackFrameProcessor = STACK_BLEND_MODES.lighten.processor;
+        let stackMedianFrameCount = 3;
+        let stackFrameHistory = [];
+        let stackMeanAccumulator = null;
+        let stackMeanFrameCount = 0;
+
+        function setButtonDisabled(button, disabled) {
+            button.disabled = disabled;
+            button.classList.toggle('opacity-40', disabled);
+            button.classList.toggle('pointer-events-none', disabled);
+        }
+
+        function syncStackSettingsUi() {
+            const mode = STACK_BLEND_MODES[stackBlendModeKey] || STACK_BLEND_MODES.lighten;
+            stackBlendModeSelect.value = stackBlendModeKey;
+            stackBlendModeValue.textContent = mode.label;
+            stackOpacitySlider.value = String(Math.round(stackFrameOpacity * 100));
+            stackOpacityValue.textContent = `${Math.round(stackFrameOpacity * 100)}%`;
+            stackOpacityField.classList.toggle('hidden', stackFrameProcessor === 'mean');
+            medianFrameCountField.classList.toggle('hidden', stackFrameProcessor !== 'median');
+            medianFrameCountSlider.value = String(stackMedianFrameCount);
+            medianFrameCountValue.textContent = String(stackMedianFrameCount);
+        }
+
+        function resetStackFrameHistory() {
+            stackFrameHistory = [];
+            stackMeanAccumulator = null;
+            stackMeanFrameCount = 0;
+        }
+
+        function copyFramePixels(sourcePixels) {
+            return new Uint8ClampedArray(sourcePixels);
+        }
+
+        function buildPreviousCurrentMeanFrame(currentPixels) {
+            const previousPixels = stackFrameHistory.length ? stackFrameHistory[stackFrameHistory.length - 1] : null;
+
+            if (!previousPixels) {
+                return null;
+            }
+
+            const output = blendCtx.createImageData(bufferCanvas.width, bufferCanvas.height);
+            const outputPixels = output.data;
+
+            for (let index = 0; index < currentPixels.length; index += 4) {
+                outputPixels[index] = Math.round((previousPixels[index] + currentPixels[index]) * 0.5);
+                outputPixels[index + 1] = Math.round((previousPixels[index + 1] + currentPixels[index + 1]) * 0.5);
+                outputPixels[index + 2] = Math.round((previousPixels[index + 2] + currentPixels[index + 2]) * 0.5);
+                outputPixels[index + 3] = 255;
+            }
+
+            return output;
+        }
+
+        function buildMeanFrame(currentPixels) {
+            const pixelCount = currentPixels.length / 4;
+
+            if (!stackMeanAccumulator || stackMeanAccumulator.length !== pixelCount * 3) {
+                stackMeanAccumulator = new Float32Array(pixelCount * 3);
+                stackMeanFrameCount = 0;
+            }
+
+            stackMeanFrameCount += 1;
+
+            const output = blendCtx.createImageData(bufferCanvas.width, bufferCanvas.height);
+            const outputPixels = output.data;
+            const previousWeight = (stackMeanFrameCount - 1) / stackMeanFrameCount;
+            const currentWeight = 1 / stackMeanFrameCount;
+
+            for (let index = 0, accumulatorIndex = 0; index < currentPixels.length; index += 4, accumulatorIndex += 3) {
+                const redMean = (stackMeanAccumulator[accumulatorIndex] * previousWeight) + (currentPixels[index] * currentWeight);
+                const greenMean = (stackMeanAccumulator[accumulatorIndex + 1] * previousWeight) + (currentPixels[index + 1] * currentWeight);
+                const blueMean = (stackMeanAccumulator[accumulatorIndex + 2] * previousWeight) + (currentPixels[index + 2] * currentWeight);
+
+                stackMeanAccumulator[accumulatorIndex] = redMean;
+                stackMeanAccumulator[accumulatorIndex + 1] = greenMean;
+                stackMeanAccumulator[accumulatorIndex + 2] = blueMean;
+
+                outputPixels[index] = Math.round(redMean);
+                outputPixels[index + 1] = Math.round(greenMean);
+                outputPixels[index + 2] = Math.round(blueMean);
+                outputPixels[index + 3] = 255;
+            }
+
+            return output;
+        }
+
+        function buildMedianFrame(currentPixels) {
+            const medianFrames = stackFrameHistory.slice(-(stackMedianFrameCount - 1));
+
+            if (medianFrames.length < (stackMedianFrameCount - 1)) {
+                return buildPreviousCurrentMeanFrame(currentPixels);
+            }
+
+            const sourceFrames = [...medianFrames, currentPixels];
+            const output = blendCtx.createImageData(bufferCanvas.width, bufferCanvas.height);
+            const outputPixels = output.data;
+
+            for (let index = 0; index < currentPixels.length; index += 4) {
+                const redSamples = sourceFrames.map((frame) => frame[index]).sort((a, b) => a - b);
+                const greenSamples = sourceFrames.map((frame) => frame[index + 1]).sort((a, b) => a - b);
+                const blueSamples = sourceFrames.map((frame) => frame[index + 2]).sort((a, b) => a - b);
+                const middleIndex = Math.floor(sourceFrames.length / 2);
+
+                outputPixels[index] = redSamples[middleIndex];
+                outputPixels[index + 1] = greenSamples[middleIndex];
+                outputPixels[index + 2] = blueSamples[middleIndex];
+                outputPixels[index + 3] = 255;
+            }
+
+            return output;
+        }
+
+        function buildStackFrameSource() {
+            if (stackFrameProcessor === 'raw') {
+                return bufferCanvas;
+            }
+
+            const currentFrame = bufferCtx.getImageData(0, 0, bufferCanvas.width, bufferCanvas.height);
+            const currentPixels = currentFrame.data;
+            const processedFrame = stackFrameProcessor === 'median'
+                ? buildMedianFrame(currentPixels)
+                : buildMeanFrame(currentPixels);
+
+            if (processedFrame) {
+                blendCtx.putImageData(processedFrame, 0, 0);
+            } else {
+                blendCtx.putImageData(currentFrame, 0, 0);
+            }
+
+            if (stackFrameProcessor === 'median') {
+                stackFrameHistory.push(copyFramePixels(currentPixels));
+
+                while (stackFrameHistory.length > stackMedianFrameCount) {
+                    stackFrameHistory.shift();
+                }
+            }
+
+            return blendCanvas;
+        }
+
+        function clearReviewImage() {
+            reviewImage.classList.add('hidden');
+            reviewImage.style.display = 'none';
+            reviewImage.removeAttribute('src');
+            canvas.classList.remove('hidden');
+            canvas.style.display = 'block';
+
+            if (!reviewImageUrl) {
+                return;
+            }
+
+            URL.revokeObjectURL(reviewImageUrl);
+            reviewImageUrl = null;
+        }
+
+        function showReviewImage(blob) {
+            clearReviewImage();
+            reviewImageUrl = URL.createObjectURL(blob);
+            reviewImage.src = reviewImageUrl;
+            reviewImage.classList.remove('hidden');
+            reviewImage.style.display = 'block';
+            canvas.classList.add('hidden');
+            canvas.style.display = 'none';
+        }
+
+        function isAppleMobileDevice() {
+            const userAgent = navigator.userAgent || '';
+            const platform = navigator.platform || '';
+            const hasTouchMac = (platform === 'MacIntel' || platform === 'Macintosh') && navigator.maxTouchPoints > 1;
+            return /iPhone|iPad|iPod/.test(userAgent) || hasTouchMac;
+        }
+
+        function syncUi() {
+            const isReady = Boolean(mediaStream) && canvas.width > 0 && canvas.height > 0;
+            const isRecording = captureState === STATES.CAPTURING;
+            const hasCapture = captureState === STATES.REVIEW;
+
+            setButtonDisabled(triggerBtn, !isReady || isStarting);
+            setButtonDisabled(resetBtn, !isReady || isStarting || captureState === STATES.PREVIEW);
+            setButtonDisabled(saveBtn, !hasCapture || isStarting);
+
+            triggerBtn.classList.toggle('bg-red-600', isRecording);
+            triggerBtn.classList.toggle('text-white', isRecording);
+            triggerBtn.classList.toggle('bg-white', !isRecording);
+            triggerBtn.classList.toggle('text-black', !isRecording);
+
+            iconPlay.classList.toggle('hidden', isRecording);
+            iconStop.classList.toggle('hidden', !isRecording);
+            hud.classList.toggle('hidden', !isRecording);
+            pingRing.classList.toggle('hidden', !isRecording);
+            closePreviewBtn.classList.toggle('hidden', !hasCapture);
+        }
+
+        function openSettings() {
+            settingsPanel.classList.remove('hidden');
+        }
+
+        function closeSettings() {
+            settingsPanel.classList.add('hidden');
+        }
+
+        function clearCompositeCanvas() {
+            if (!canvas.width || !canvas.height) {
+                return;
+            }
+
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            resetStackFrameHistory();
+        }
+
+        function startRenderLoop() {
+            if (animationFrameId) {
+                return;
+            }
+
+            const tick = () => {
+                drawFrame();
+                animationFrameId = requestAnimationFrame(tick);
+            };
+
+            tick();
+        }
+
+        function stopRenderLoop() {
+            if (!animationFrameId) {
+                return;
+            }
+
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = 0;
+        }
+
+        function setState(nextState) {
+            captureState = nextState;
+
+            if (captureState === STATES.REVIEW) {
+                stopRenderLoop();
+            } else if (mediaStream) {
+                clearReviewImage();
+                startRenderLoop();
+            }
+
+            syncUi();
+        }
+
+        async function shareCapture(blob, fileName) {
+            if (!supportsCaptureSharing) {
+                return false;
+            }
+
+            const file = new File([blob], fileName, { type: blob.type });
+
+            if (!navigator.canShare({ files: [file] })) {
+                return false;
+            }
+
+            await navigator.share({
+                files: [file],
+                title: 'Time Volume Capture'
+            });
+
+            return true;
+        }
+
+        function showError(message) {
+            startOverlay.classList.add('hidden');
+            errorView.classList.remove('hidden');
+            errorMsg.innerText = message;
+        }
+
+        function describeCameraError(error) {
+            switch (error.name) {
+                case 'NotAllowedError':
+                    return 'Camera permission was denied. Please allow access and try again.';
+                case 'NotFoundError':
+                    return 'No camera was found on this device.';
+                case 'NotReadableError':
+                    return 'The camera is already in use by another app.';
+                case 'OverconstrainedError':
+                    return 'This device could not match the requested camera settings.';
+                case 'SecurityError':
+                    return 'Camera access requires HTTPS or localhost.';
+                default:
+                    return error.message || 'Could not access the camera.';
+            }
+        }
+
+        function waitForVideoReady(timeoutMs = 10000) {
+            if (video.videoWidth && video.videoHeight) {
+                return Promise.resolve();
+            }
+
+            return new Promise((resolve, reject) => {
+                const timeoutId = window.setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Camera preview timed out.'));
+                }, timeoutMs);
+
+                function cleanup() {
+                    window.clearTimeout(timeoutId);
+                    video.removeEventListener('loadedmetadata', handleReady);
+                    video.removeEventListener('playing', handleReady);
+                    video.removeEventListener('error', handleError);
+                }
+
+                function handleReady() {
+                    if (!video.videoWidth || !video.videoHeight) {
+                        return;
+                    }
+
+                    cleanup();
+                    resolve();
+                }
+
+                function handleError() {
+                    cleanup();
+                    reject(new Error('Camera preview could not start.'));
+                }
+
+                video.addEventListener('loadedmetadata', handleReady);
+                video.addEventListener('playing', handleReady);
+                video.addEventListener('error', handleError);
+            });
+        }
+
+        async function requestCameraStream() {
+            let lastError = null;
+
+            for (const constraints of cameraProfiles) {
+                try {
+                    return await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (error) {
+                    lastError = error;
+                    if (error.name !== 'OverconstrainedError' && error.name !== 'NotFoundError') {
+                        throw error;
+                    }
+                }
+            }
+
+            throw lastError || new Error('Could not access the camera.');
+        }
+
+        function drawFrame() {
+            if (!mediaStream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+                return;
+            }
+
+            bufferCtx.globalCompositeOperation = 'source-over';
+            bufferCtx.drawImage(video, 0, 0, bufferCanvas.width, bufferCanvas.height);
+
+            if (captureState === STATES.PREVIEW) {
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.globalAlpha = 1;
+                ctx.drawImage(bufferCanvas, 0, 0, canvas.width, canvas.height);
+            } else if (captureState === STATES.CAPTURING) {
+                const stackFrameSource = buildStackFrameSource();
+                const frameOpacity = stackFrameProcessor === 'mean' ? 1 : stackFrameOpacity;
+                ctx.globalCompositeOperation = stackBlendMode;
+                ctx.globalAlpha = frameOpacity;
+                ctx.drawImage(stackFrameSource, 0, 0, canvas.width, canvas.height);
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        function stopStream() {
+            if (!mediaStream) {
+                return;
+            }
+
+            mediaStream.getTracks().forEach((track) => track.stop());
+            mediaStream = null;
+            video.srcObject = null;
+        }
+
+        async function startSystem() {
+            if (isStarting || mediaStream) {
+                return;
+            }
+
+            if (!window.isSecureContext) {
+                showError('Camera access requires HTTPS or localhost. If you are opening this from the Raspberry Pi over a local IP address, the page needs to be served securely.');
+                return;
+            }
+
+            if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+                showError('This browser does not support live camera capture. Try a recent version of Safari or Chrome.');
+                return;
+            }
+
+            isStarting = true;
+            syncUi();
+
+            try {
+                mediaStream = await requestCameraStream();
+                const readyPromise = waitForVideoReady();
+                video.srcObject = mediaStream;
+                await Promise.all([readyPromise, video.play()]);
+
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                bufferCanvas.width = video.videoWidth;
+                bufferCanvas.height = video.videoHeight;
+                blendCanvas.width = video.videoWidth;
+                blendCanvas.height = video.videoHeight;
+
+                clearCompositeCanvas();
+                errorView.classList.add('hidden');
+                startOverlay.classList.add('hidden');
+                setState(STATES.PREVIEW);
+                drawFrame();
+            } catch (error) {
+                console.error('Camera Error:', error);
+                stopStream();
+                setState(STATES.IDLE);
+                showError(describeCameraError(error));
+            } finally {
+                isStarting = false;
+                syncUi();
+            }
+        }
+
+        function startCapture() {
+            if (!mediaStream || !canvas.width || !canvas.height) {
+                return;
+            }
+
+            clearCompositeCanvas();
+            setState(STATES.CAPTURING);
+        }
+
+        async function stopCapture() {
+            if (captureState !== STATES.CAPTURING) {
+                return;
+            }
+
+            setState(STATES.REVIEW);
+
+            try {
+                const blob = await canvasToBlob(canvas, 'image/jpeg', 0.92);
+                showReviewImage(blob);
+            } catch (error) {
+                console.error('Review Image Error:', error);
+            }
+        }
+
+        function resetCapture() {
+            if (!mediaStream) {
+                return;
+            }
+
+            clearReviewImage();
+            clearCompositeCanvas();
+            setState(STATES.PREVIEW);
+            drawFrame();
+        }
+
+        function closeReviewCapture() {
+            if (!mediaStream || captureState !== STATES.REVIEW) {
+                return;
+            }
+
+            clearReviewImage();
+            setState(STATES.PREVIEW);
+            drawFrame();
+        }
+
+        function canvasToBlob(targetCanvas, type, quality) {
+            return new Promise((resolve, reject) => {
+                targetCanvas.toBlob((blob) => {
+                    if (!blob) {
+                        reject(new Error('Could not create an image from the current capture.'));
+                        return;
+                    }
+
+                    resolve(blob);
+                }, type, quality);
+            });
+        }
+
+        function downloadBlob(blob, fileName) {
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.download = fileName;
+            link.href = objectUrl;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+        }
+
+        async function saveCapture() {
+            if (captureState !== STATES.REVIEW || saveBtn.disabled) {
+                return;
+            }
+
+            setButtonDisabled(saveBtn, true);
+
+            try {
+                const blob = await canvasToBlob(canvas, 'image/jpeg', 0.92);
+                const fileName = `light-sculpture-${Date.now()}.jpg`;
+
+                if (isAppleMobileDevice()) {
+                    const didShare = await shareCapture(blob, fileName);
+                    if (didShare) {
+                        return;
+                    }
+                }
+
+                downloadBlob(blob, fileName);
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    console.error('Save Error:', error);
+                    showError(error.message || 'Could not save the current capture.');
+                }
+            } finally {
+                syncUi();
+            }
+        }
+
+        function handleTriggerClick() {
+            if (captureState === STATES.CAPTURING) {
+                stopCapture();
+                return;
+            }
+
+            startCapture();
+        }
+
+        function handleVisibilityChange() {
+            if (document.hidden) {
+                stopRenderLoop();
+                return;
+            }
+
+            if (mediaStream && captureState !== STATES.REVIEW) {
+                video.play().catch(() => {});
+                startRenderLoop();
+                if (captureState === STATES.PREVIEW) {
+                    drawFrame();
+                }
+            }
+        }
+
+        function teardownCamera() {
+            closeSettings();
+            clearReviewImage();
+            stopRenderLoop();
+            stopStream();
+        }
+
+        function handleStackBlendModeChange() {
+            const nextMode = STACK_BLEND_MODES[stackBlendModeSelect.value];
+            if (!nextMode) {
+                return;
+            }
+
+            stackBlendModeKey = stackBlendModeSelect.value;
+            stackBlendMode = nextMode.composite;
+            stackFrameOpacity = nextMode.opacity;
+            stackFrameProcessor = nextMode.processor;
+            resetStackFrameHistory();
+            syncStackSettingsUi();
+        }
+
+        function handleStackOpacityInput() {
+            stackFrameOpacity = Number(stackOpacitySlider.value) / 100;
+            stackOpacityValue.textContent = `${Math.round(stackFrameOpacity * 100)}%`;
+        }
+
+        function handleMedianFrameCountInput() {
+            stackMedianFrameCount = Number(medianFrameCountSlider.value);
+            medianFrameCountValue.textContent = String(stackMedianFrameCount);
+            resetStackFrameHistory();
+        }
+
+        initBtn.addEventListener('click', startSystem);
+        triggerBtn.addEventListener('click', handleTriggerClick);
+        resetBtn.addEventListener('click', resetCapture);
+        settingsBtn.addEventListener('click', openSettings);
+        settingsBackdrop.addEventListener('click', closeSettings);
+        closeSettingsBtn.addEventListener('click', closeSettings);
+        stackBlendModeSelect.addEventListener('change', handleStackBlendModeChange);
+        stackOpacitySlider.addEventListener('input', handleStackOpacityInput);
+        medianFrameCountSlider.addEventListener('input', handleMedianFrameCountInput);
+        closePreviewBtn.addEventListener('click', closeReviewCapture);
+        saveBtn.addEventListener('click', saveCapture);
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        window.addEventListener('pagehide', teardownCamera);
+        window.addEventListener('beforeunload', teardownCamera);
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./service-worker.js').catch((error) => {
+                    console.error('Service Worker Registration Failed:', error);
+                });
+            });
+        }
+
+        syncStackSettingsUi();
+        syncUi();
+    </script>
+</body>
+</html>

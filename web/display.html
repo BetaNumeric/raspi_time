@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Time Volume Display</title>
+    <style>
+        :root {
+            --fg: #f7f3ee;
+            --muted: rgba(247, 243, 238, 0.72);
+            --line: rgba(255, 255, 255, 0.12);
+            --panel: rgba(0, 0, 0, 0.38);
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            color: var(--fg);
+            font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
+        }
+
+        body {
+            position: relative;
+            cursor: none;
+        }
+
+        #displayCanvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #000;
+        }
+
+        #hiddenVideo {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .hud {
+            position: absolute;
+            left: 20px;
+            right: 20px;
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            pointer-events: none;
+        }
+
+        .hud-top { top: 20px; }
+        .hud-bottom { bottom: 20px; align-items: flex-end; }
+
+        .hud-card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            padding: 14px 16px;
+            min-width: 180px;
+            backdrop-filter: blur(16px);
+        }
+
+        .hud-label {
+            font-size: 11px;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin-bottom: 6px;
+        }
+
+        .hud-value {
+            font-size: clamp(1rem, 2vw, 1.7rem);
+            letter-spacing: -0.04em;
+            font-weight: 800;
+        }
+
+        .countdown {
+            position: absolute;
+            inset: 0;
+            display: none;
+            place-items: center;
+            text-align: center;
+            background: radial-gradient(circle, rgba(255, 113, 70, 0.18), rgba(0, 0, 0, 0.3) 45%, rgba(0, 0, 0, 0.72));
+            pointer-events: none;
+        }
+
+        .countdown-number {
+            font-size: min(34vw, 16rem);
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: -0.08em;
+        }
+
+        .countdown-copy {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: clamp(0.9rem, 1.5vw, 1.2rem);
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+
+        #armButton {
+            position: absolute;
+            right: 20px;
+            top: 20px;
+            z-index: 5;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--fg);
+            font: inherit;
+            cursor: pointer;
+        }
+
+        body.clean .hud,
+        body.clean #armButton {
+            display: none;
+        }
+
+        body.clean .countdown {
+            background: transparent;
+        }
+    </style>
+</head>
+<body class="clean">
+    <canvas id="displayCanvas"></canvas>
+    <video id="hiddenVideo" muted playsinline preload="auto"></video>
+
+    <div class="hud hud-top">
+        <div class="hud-card"><div class="hud-label">Sequence</div><div class="hud-value" id="sequenceName">Waiting</div></div>
+        <div class="hud-card"><div class="hud-label">Mode</div><div class="hud-value" id="modeLabel">Idle</div></div>
+    </div>
+
+    <div class="hud hud-bottom">
+        <div class="hud-card"><div class="hud-label">Position</div><div class="hud-value" id="positionLabel">0.0%</div></div>
+        <div class="hud-card"><div class="hud-label">Frame</div><div class="hud-value" id="frameLabel">Ready</div></div>
+    </div>
+
+    <div id="countdown" class="countdown">
+        <div>
+            <div class="countdown-number" id="countdownNumber">3</div>
+            <div class="countdown-copy">Sequence Starting</div>
+        </div>
+    </div>
+
+    <button id="armButton" type="button">Arm Display</button>
+    <script>
+        const query = new URLSearchParams(window.location.search);
+        const showHud = query.get("hud") === "1";
+        const showCountdown = query.get("countdown") === "1";
+
+        if (showHud) {
+            document.body.classList.remove("clean");
+        }
+
+        const canvas = document.getElementById("displayCanvas");
+        const ctx = canvas.getContext("2d", { alpha: false });
+        const hiddenVideo = document.getElementById("hiddenVideo");
+        const sequenceName = document.getElementById("sequenceName");
+        const modeLabel = document.getElementById("modeLabel");
+        const positionLabel = document.getElementById("positionLabel");
+        const frameLabel = document.getElementById("frameLabel");
+        const countdown = document.getElementById("countdown");
+        const countdownNumber = document.getElementById("countdownNumber");
+        const armButton = document.getElementById("armButton");
+
+        let currentState = null;
+        let currentSequence = null;
+        let currentSequenceId = null;
+        let wakeLock = null;
+        let lastDrawnImageUrl = null;
+        let activeImage = null;
+        let canvasRevision = 0;
+        let lastRenderedAssetKey = null;
+        let lastRenderedCanvasRevision = -1;
+
+        const IMAGE_PRELOAD_RADIUS = 3;
+        const IMAGE_CACHE_LIMIT = 48;
+        const imageCache = new Map();
+
+        const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+        const frameIndexForPosition = (frameCount, pct) => !frameCount || frameCount <= 1 ? 0 : Math.min(frameCount - 1, Math.round((clamp(pct, 0, 100) / 100) * (frameCount - 1)));
+
+        function resizeCanvas() {
+            const dpr = Math.max(1, window.devicePixelRatio || 1);
+            const width = Math.round(window.innerWidth * dpr);
+            const height = Math.round(window.innerHeight * dpr);
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width;
+                canvas.height = height;
+                canvasRevision += 1;
+                lastRenderedAssetKey = null;
+            }
+            drawCurrentFrame();
+        }
+
+        function clearCanvas() {
+            lastRenderedAssetKey = null;
+            lastRenderedCanvasRevision = -1;
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function drawAsset(source, sourceWidth, sourceHeight, assetKey = null) {
+            if (assetKey && assetKey === lastRenderedAssetKey && lastRenderedCanvasRevision === canvasRevision) {
+                return;
+            }
+
+            clearCanvas();
+            if (!source || !sourceWidth || !sourceHeight) {
+                return;
+            }
+
+            const canvasAspect = canvas.width / canvas.height;
+            const sourceAspect = sourceWidth / sourceHeight;
+            let drawWidth = canvas.width;
+            let drawHeight = canvas.height;
+
+            if (sourceAspect > canvasAspect) {
+                drawHeight = drawWidth / sourceAspect;
+            } else {
+                drawWidth = drawHeight * sourceAspect;
+            }
+
+            const x = (canvas.width - drawWidth) / 2;
+            const y = (canvas.height - drawHeight) / 2;
+            ctx.drawImage(source, x, y, drawWidth, drawHeight);
+
+            if (assetKey) {
+                lastRenderedAssetKey = assetKey;
+                lastRenderedCanvasRevision = canvasRevision;
+            }
+        }
+
+        function clearImageCache() {
+            imageCache.clear();
+            activeImage = null;
+            lastDrawnImageUrl = null;
+            lastRenderedAssetKey = null;
+            lastRenderedCanvasRevision = -1;
+        }
+
+        function rememberImage(url, entry) {
+            if (imageCache.has(url)) {
+                imageCache.delete(url);
+            }
+            imageCache.set(url, entry);
+
+            while (imageCache.size > IMAGE_CACHE_LIMIT) {
+                const oldestUrl = imageCache.keys().next().value;
+                imageCache.delete(oldestUrl);
+            }
+        }
+
+        function getImageCacheEntry(url) {
+            const entry = imageCache.get(url);
+            if (!entry) {
+                return null;
+            }
+            rememberImage(url, entry);
+            return entry;
+        }
+
+        function requestImage(url, onLoad = null) {
+            const cachedEntry = getImageCacheEntry(url);
+            if (cachedEntry) {
+                if (cachedEntry.loaded && cachedEntry.image.naturalWidth) {
+                    if (onLoad) onLoad(cachedEntry.image);
+                } else if (onLoad) {
+                    cachedEntry.image.addEventListener("load", () => onLoad(cachedEntry.image), { once: true });
+                }
+                return cachedEntry.image;
+            }
+
+            const image = new Image();
+            const entry = { image, loaded: false };
+            image.decoding = "async";
+            image.loading = "eager";
+            image.addEventListener("load", () => {
+                entry.loaded = true;
+                if (onLoad) onLoad(image);
+            }, { once: true });
+            image.addEventListener("error", () => {
+                imageCache.delete(url);
+            }, { once: true });
+            rememberImage(url, entry);
+            image.src = url;
+            return image;
+        }
+
+        function preloadNearbyFrames(centerIndex) {
+            if (!currentSequence || currentSequence.kind !== "images") {
+                return;
+            }
+
+            const start = Math.max(0, centerIndex - IMAGE_PRELOAD_RADIUS);
+            const end = Math.min(currentSequence.frame_count - 1, centerIndex + IMAGE_PRELOAD_RADIUS);
+
+            for (let index = start; index <= end; index += 1) {
+                const url = currentSequence.frame_urls[index];
+                if (url) {
+                    requestImage(url);
+                }
+            }
+        }
+
+        function describeMode(state) {
+            if (state.switch_direction !== 0) return state.switch_direction > 0 ? "Manual extend" : "Manual retract";
+            if (state.is_cycling) return "Cycle mode";
+            if (state.countdown_remaining > 0) return `Countdown ${state.countdown_remaining}s`;
+            if (state.is_moving && state.is_paused) return "Paused";
+            if (state.is_moving) return "Moving";
+            return "Idle";
+        }
+
+        async function apiGet(url) {
+            const response = await fetch(url, { cache: "no-store" });
+            if (!response.ok) throw new Error(`GET ${url} failed`);
+            return response.json();
+        }
+
+        async function loadSequence(sequenceId) {
+            if (!sequenceId) {
+                currentSequence = null;
+                currentSequenceId = null;
+                clearImageCache();
+                hiddenVideo.pause();
+                hiddenVideo.removeAttribute("src");
+                delete hiddenVideo.dataset.src;
+                hiddenVideo.load();
+                drawCurrentFrame();
+                return;
+            }
+
+            clearImageCache();
+            currentSequence = await apiGet(`/api/sequence?id=${encodeURIComponent(sequenceId)}`);
+            currentSequenceId = sequenceId;
+
+            if (currentSequence.kind === "video" && hiddenVideo.dataset.src !== currentSequence.media_url) {
+                hiddenVideo.pause();
+                hiddenVideo.dataset.src = currentSequence.media_url;
+                hiddenVideo.src = currentSequence.media_url;
+                hiddenVideo.load();
+            }
+
+            drawCurrentFrame();
+        }
+
+        function updateOverlays() {
+            if (!currentState) {
+                sequenceName.textContent = "Waiting";
+                modeLabel.textContent = "Idle";
+                positionLabel.textContent = "0.0%";
+                frameLabel.textContent = "Ready";
+                countdown.style.display = "none";
+                return;
+            }
+
+            sequenceName.textContent = currentState.selected_sequence_name || "Waiting";
+            modeLabel.textContent = describeMode(currentState);
+            positionLabel.textContent = `${currentState.position_pct.toFixed(1)}%`;
+
+            if (showCountdown && currentState.countdown_remaining > 0) {
+                countdown.style.display = "grid";
+                countdownNumber.textContent = currentState.countdown_remaining;
+            } else {
+                countdown.style.display = "none";
+            }
+        }
+
+        function drawCurrentFrame() {
+            updateOverlays();
+
+            if (!currentState || !currentSequence) {
+                clearCanvas();
+                return;
+            }
+
+            if (currentSequence.kind === "images") {
+                const index = frameIndexForPosition(currentSequence.frame_count, currentState.position_pct);
+                const imageUrl = currentSequence.frame_urls[index];
+                frameLabel.textContent = `Frame ${index + 1} / ${currentSequence.frame_count}`;
+                preloadNearbyFrames(index);
+
+                const cachedEntry = getImageCacheEntry(imageUrl);
+                if (cachedEntry && cachedEntry.loaded && cachedEntry.image.naturalWidth) {
+                    activeImage = cachedEntry.image;
+                    lastDrawnImageUrl = imageUrl;
+                    drawAsset(activeImage, activeImage.naturalWidth, activeImage.naturalHeight, imageUrl);
+                    return;
+                }
+
+                requestImage(imageUrl, (image) => {
+                    if (currentSequence && imageUrl === currentSequence.frame_urls[frameIndexForPosition(currentSequence.frame_count, currentState.position_pct)]) {
+                        activeImage = image;
+                        lastDrawnImageUrl = imageUrl;
+                        drawAsset(image, image.naturalWidth, image.naturalHeight, imageUrl);
+                    }
+                });
+                return;
+            }
+
+            frameLabel.textContent = Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0
+                ? `${Math.round(currentState.position_pct)}% through clip`
+                : "Loading clip...";
+
+            if (Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0) {
+                const targetTime = (currentState.position_pct / 100) * hiddenVideo.duration;
+                if (Math.abs(hiddenVideo.currentTime - targetTime) > 0.033) {
+                    try {
+                        hiddenVideo.currentTime = targetTime;
+                    } catch (error) {}
+                } else {
+                    drawAsset(hiddenVideo, hiddenVideo.videoWidth, hiddenVideo.videoHeight);
+                }
+                return;
+            }
+
+            clearCanvas();
+        }
+
+        async function applyState(state) {
+            currentState = state;
+            if ((state.selected_sequence_id || null) !== currentSequenceId) {
+                await loadSequence(state.selected_sequence_id);
+            }
+            drawCurrentFrame();
+        }
+
+        async function refreshStateLoop() {
+            try {
+                const state = await apiGet("/api/state");
+                await applyState(state);
+            } catch (error) {
+                if (showHud) {
+                    modeLabel.textContent = "Connection lost";
+                }
+                clearCanvas();
+            } finally {
+                setTimeout(refreshStateLoop, 120);
+            }
+        }
+
+        async function armDisplay() {
+            if (document.fullscreenElement == null && document.documentElement.requestFullscreen) {
+                try { await document.documentElement.requestFullscreen(); } catch (error) {}
+            }
+            if ("wakeLock" in navigator) {
+                try { wakeLock = await navigator.wakeLock.request("screen"); } catch (error) {}
+            }
+        }
+
+        hiddenVideo.addEventListener("loadedmetadata", drawCurrentFrame);
+        hiddenVideo.addEventListener("seeked", () => {
+            drawAsset(hiddenVideo, hiddenVideo.videoWidth, hiddenVideo.videoHeight);
+        });
+        hiddenVideo.addEventListener("loadeddata", drawCurrentFrame);
+        armButton.addEventListener("click", armDisplay);
+        window.addEventListener("resize", resizeCanvas);
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === "visible" && wakeLock == null) {
+                armDisplay();
+            }
+        });
+
+        resizeCanvas();
+        refreshStateLoop();
+    </script>
+</body>
+</html>
