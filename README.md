@@ -1,6 +1,6 @@
 # Time Volume
 
-Raspberry Pi 4 control stack for a scissor-lift monitor installation.
+Raspberry Pi 4 control stack for a scissor-lift monitor.
 
 The active runtime is the web stack:
 
