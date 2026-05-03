@@ -10,6 +10,12 @@ LOG_FILE="$RUN_DIR/time_volume_server.log"
 HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
 DISPLAY_PATH="${TIME_VOLUME_DISPLAY_PATH:-/display}"
+DEFAULT_CAMERA_URL="https://betanumeric.github.io/volumetric_time_camera/"
+if [[ -n "${TIME_VOLUME_CAMERA_URL+x}" ]]; then
+    CAMERA_URL="$TIME_VOLUME_CAMERA_URL"
+else
+    CAMERA_URL="$DEFAULT_CAMERA_URL"
+fi
 DISPLAY_URL="http://127.0.0.1:${PORT}${DISPLAY_PATH}"
 HEALTH_URL="http://127.0.0.1:${PORT}/api/state"
 
@@ -112,7 +118,13 @@ print_urls() {
     ip_address="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [[ -n "${ip_address:-}" ]]; then
         echo "Controller: http://${ip_address}:${PORT}/controller"
-        echo "Camera    : http://${ip_address}:${PORT}/camera/"
+        if [[ -n "$CAMERA_URL" ]]; then
+            echo "Camera    : $CAMERA_URL"
+        elif [[ -f "$SCRIPT_DIR/camera_app/index.html" ]]; then
+            echo "Camera    : http://${ip_address}:${PORT}/camera/"
+        else
+            echo "Camera    : not configured"
+        fi
     fi
     echo "Display   : $DISPLAY_URL"
 }

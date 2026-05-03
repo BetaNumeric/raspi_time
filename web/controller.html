@@ -830,7 +830,7 @@
                     <div class="eyebrow">Open</div>
                     <div class="advanced-links" style="margin-top: 10px;">
                         <a class="link-button" href="/display" target="_blank" rel="noreferrer">Display</a>
-                        <a class="link-button" href="/camera/" target="_blank" rel="noreferrer">Camera</a>
+                        <a id="cameraLink" class="link-button" href="/camera/" target="_blank" rel="noreferrer" hidden>Camera</a>
                     </div>
                 </section>
             </div>
@@ -885,6 +885,7 @@
         const currentMarker = $("#currentMarker");
         const runStatus = $("#runStatus");
         const runStatusText = $("#runStatusText");
+        const cameraLink = $("#cameraLink");
 
         let currentState = null;
         let currentSequence = null;
@@ -1195,6 +1196,10 @@
             mediaRootNote.textContent = `Media: ${state.media_root}`;
             simulationPill.hidden = !state.is_simulation;
             cycleFlag.hidden = !state.is_cycling;
+            cameraLink.hidden = !state.camera_url;
+            if (state.camera_url) {
+                cameraLink.href = state.camera_url;
+            }
             if (targetRange.disabled !== state.is_cycling) {
                 targetRange.disabled = state.is_cycling;
                 if (state.is_cycling) {

@@ -43,6 +43,12 @@ SW_DEBOUNCE_SAMPLES = 2
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 MEDIA_ROOT = BASE_DIR / "media"
+CAMERA_APP_DIR = Path(os.environ.get("TIME_VOLUME_CAMERA_DIR", BASE_DIR / "camera_app")).expanduser()
+if not CAMERA_APP_DIR.is_absolute():
+    CAMERA_APP_DIR = BASE_DIR / CAMERA_APP_DIR
+CAMERA_APP_DIR = CAMERA_APP_DIR.resolve()
+DEFAULT_CAMERA_URL = "https://betanumeric.github.io/volumetric_time_camera/"
+EXTERNAL_CAMERA_URL = os.environ.get("TIME_VOLUME_CAMERA_URL", DEFAULT_CAMERA_URL).strip()
 STATE_FILE = BASE_DIR / "actuator_state.json"
 DEFAULT_HOST = os.environ.get("ACTUATOR_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("ACTUATOR_PORT", "8000"))
@@ -57,6 +63,18 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 def media_url_for(relative_path: str) -> str:
     return f"/media/{quote(relative_path, safe='/')}"
+
+
+def camera_app_available() -> bool:
+    return (CAMERA_APP_DIR / "index.html").is_file()
+
+
+def configured_camera_url() -> str | None:
+    if EXTERNAL_CAMERA_URL:
+        return EXTERNAL_CAMERA_URL
+    if camera_app_available():
+        return "/camera/"
+    return None
 
 
 @dataclass
@@ -591,7 +609,7 @@ class InstallationController:
             "media_root": str(MEDIA_ROOT),
             "controller_url": "/controller",
             "display_url": "/display",
-            "camera_url": "/camera/",
+            "camera_url": configured_camera_url(),
         }
 
     def set_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1198,9 +1216,20 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             self._send_json(detail, head_only=head_only)
             return
         if path == "/camera":
-            self._redirect("/camera/")
+            camera_url = configured_camera_url()
+            if camera_url and camera_url != "/camera/":
+                self._redirect(camera_url)
+                return
+            if camera_app_available():
+                self._redirect("/camera/")
+                return
+            self._json_error(HTTPStatus.NOT_FOUND, "Camera app is not installed")
             return
         if path.startswith("/camera/"):
+            camera_url = configured_camera_url()
+            if camera_url and camera_url != "/camera/":
+                self._redirect(camera_url)
+                return
             self._serve_camera_asset(path, head_only=head_only)
             return
         if path.startswith("/media/"):
@@ -1293,14 +1322,11 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_camera_asset(self, request_path: str, head_only: bool) -> None:
-        relative = request_path[len("/camera/") :]
+        relative = unquote(request_path[len("/camera/") :]).replace("\\", "/")
         if relative in {"", "index.html"}:
-            file_path = BASE_DIR / "index.html"
-        elif relative in {"manifest.json", "service-worker.js"}:
-            file_path = BASE_DIR / relative
-        elif relative.startswith("icons/"):
-            file_path = BASE_DIR / relative
-        else:
+            relative = "index.html"
+        file_path = self._safe_join(CAMERA_APP_DIR, relative)
+        if not file_path or not file_path.is_file():
             self._json_error(HTTPStatus.NOT_FOUND, "Camera asset not found")
             return
         self._serve_file(file_path, cache_control="no-store", head_only=head_only)
@@ -1450,13 +1476,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def print_launch_hints(host: str, port: int) -> None:
     hostname = socket.gethostname()
+    camera_url = configured_camera_url()
     print()
     print("Time Volume web server is running.")
     print(f"Controller: http://localhost:{port}/controller")
     print(f"Display   : http://localhost:{port}/display")
-    print(f"Camera    : http://localhost:{port}/camera/")
+    if camera_url == "/camera/":
+        print(f"Camera    : http://localhost:{port}/camera/")
+    elif camera_url:
+        print(f"Camera    : {camera_url}")
+    else:
+        print("Camera    : not configured")
     if host in {"0.0.0.0", "::"}:
         print(f"On your network, try: http://{hostname}.local:{port}/controller")
+        if camera_url == "/camera/":
+            print(f"Camera on your network: http://{hostname}.local:{port}/camera/")
     print(f"Media folder: {MEDIA_ROOT}")
     print("Copy image-sequence folders or video files into the media folder, then tap Refresh Library.")
     print()

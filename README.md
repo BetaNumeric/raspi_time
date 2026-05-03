@@ -4,10 +4,10 @@ Raspberry Pi 4 control stack for a scissor-lift monitor.
 
 The active runtime is the web stack:
 
-- `actuator_web.py` hosts the actuator API, controller PWA, display page, camera app, and media files.
+- `actuator_web.py` hosts the actuator API, controller PWA, display page, optional camera redirect, and media files.
 - `web/controller.html` is the phone/tablet lift controller.
 - `web/display.html` is the fullscreen monitor output shown on the lift.
-- `index.html`, `manifest.json`, `service-worker.js`, and `icons/` are the long-exposure camera PWA served at `/camera/`.
+- The long-exposure camera PWA is hosted separately at `https://betanumeric.github.io/volumetric_time_camera/`.
 - `media/` contains image sequences and video clips used by the display.
 - `start_time_volume.sh`, `stop_time_volume.sh`, `install_pi_launchers.sh`, and `install_boot_service.sh` are Raspberry Pi launch helpers.
 
@@ -21,11 +21,35 @@ Then open:
 
 - Controller: `http://<pi-address>:8000/controller`
 - Display: `http://127.0.0.1:8000/display`
-- Camera: `http://<pi-address>:8000/camera/`
+- Camera: `https://betanumeric.github.io/volumetric_time_camera/`
 
 Camera access from phones/tablets usually requires HTTPS, except on `localhost`.
 If the camera PWA opens but cannot initialize the camera over a Pi LAN address,
 serve the app through HTTPS or a trusted local tunnel.
+
+## Camera App
+
+The camera app is hosted separately on GitHub Pages:
+
+```text
+https://betanumeric.github.io/volumetric_time_camera/
+```
+
+The Pi controller uses that URL by default. The local `/camera/` route redirects
+there, and the controller/display/actuator stack no longer depends on local
+camera files.
+
+To point the Pi at a different hosted camera app later:
+
+```bash
+TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./start_time_volume.sh
+```
+
+For the boot service, pass the override while installing:
+
+```bash
+sudo env TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./install_boot_service.sh
+```
 
 For the Pi kiosk flow, run:
 

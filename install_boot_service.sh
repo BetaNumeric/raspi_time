@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${TIME_VOLUME_PYTHON:-$(command -v python3 || printf '/usr/bin/python3')}"
 HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
+CAMERA_URL="${TIME_VOLUME_CAMERA_URL:-}"
+CAMERA_DIR="${TIME_VOLUME_CAMERA_DIR:-}"
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -45,7 +47,17 @@ RestartSec=2
 User=$RUN_USER
 Group=$RUN_GROUP
 Environment=PYTHONUNBUFFERED=1
+EOF
 
+if [[ -n "$CAMERA_URL" ]]; then
+    printf 'Environment="TIME_VOLUME_CAMERA_URL=%s"\n' "$CAMERA_URL" >> "$SERVICE_PATH"
+fi
+
+if [[ -n "$CAMERA_DIR" ]]; then
+    printf 'Environment="TIME_VOLUME_CAMERA_DIR=%s"\n' "$CAMERA_DIR" >> "$SERVICE_PATH"
+fi
+
+cat >> "$SERVICE_PATH" <<EOF
 [Install]
 WantedBy=multi-user.target
 EOF

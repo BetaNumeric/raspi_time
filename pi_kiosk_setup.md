@@ -32,12 +32,25 @@ on the Pi desktop. Clicking `Start Time Volume.desktop` will:
 2. wait for the server to come online
 3. open the fullscreen display at `/display`
 
-The same server also hosts the phone controller and camera app.
+The same server hosts the phone controller. The camera app is hosted separately
+on GitHub Pages:
 
-Camera access from a phone/tablet browser generally needs HTTPS unless the page
-is opened on `localhost`. If `/camera/` loads but camera initialization fails
-over `http://<pi-address>:8000`, put the Pi behind HTTPS or a trusted local
-tunnel for the camera app.
+```text
+https://betanumeric.github.io/volumetric_time_camera/
+```
+
+The Pi controller uses that URL by default, and `/camera/` redirects there. To
+override it later, set `TIME_VOLUME_CAMERA_URL`:
+
+```bash
+TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./start_time_volume.sh
+```
+
+For a boot-managed server, pass the override during install:
+
+```bash
+sudo env TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./install_boot_service.sh
+```
 
 If you want it to auto-start at login too:
 
