@@ -1217,6 +1217,16 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         if path in {"/display", "/display/"}:
             self._serve_file(WEB_DIR / "display.html", cache_control="no-store", head_only=head_only)
             return
+        if path == "/manifest.json":
+            self._serve_file(WEB_DIR / "manifest.json", cache_control="no-cache", head_only=head_only)
+            return
+        if path == "/sw.js":
+            self._serve_file(WEB_DIR / "sw.js", cache_control="no-cache", head_only=head_only)
+            return
+        if path.startswith("/icons/"):
+            relative_path = unquote(path[len("/icons/"):])
+            self._serve_file(BASE_DIR / "icons" / relative_path, cache_control="public, max-age=86400", head_only=head_only)
+            return
         if path == "/api/state":
             self._send_json(self._controller_state(), head_only=head_only)
             return

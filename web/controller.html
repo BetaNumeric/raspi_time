@@ -4,6 +4,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Time Volume Lift Control</title>
+    
+    <!-- PWA Settings -->
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/controller_icon_32.png">
+    <meta name="theme-color" content="#12161c">
+    <link rel="apple-touch-icon" href="/icons/controller_icon_192.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Time Volume">
+    
     <style>
         :root {
             --panel: rgba(18, 22, 28, 0.94);
@@ -1917,6 +1927,14 @@
         previewVideo.addEventListener("seeked", renderPreview);
         bindJogButton($("#retractBtn"), -1);
         bindJogButton($("#extendBtn"), 1);
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js').catch((err) => {
+                    console.log('ServiceWorker registration failed: ', err);
+                });
+            });
+        }
 
         (async () => {
             updateTargetInputs(0);
