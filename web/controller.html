@@ -441,8 +441,27 @@
         .preview-meta { margin-top: 10px; color: var(--muted); }
         .field { display: grid; gap: 8px; }
         .field label { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
+        .range-label {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .range-value {
+            color: var(--text);
+            font-weight: 800;
+            letter-spacing: 0;
+            text-transform: none;
+            white-space: nowrap;
+        }
+
         input[type="range"] { width: 100%; accent-color: var(--accent); }
-        input[type="number"], select {
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent);
+        }
+        input[type="number"], input[type="text"], select {
             width: 100%;
             min-height: 50px;
             border: 1px solid var(--line);
@@ -450,6 +469,10 @@
             color: var(--text);
             padding: 0 14px;
             font-size: 16px;
+        }
+
+        input[disabled] {
+            opacity: 0.62;
         }
 
         select, option {
@@ -618,6 +641,60 @@
             gap: 14px;
         }
 
+        .pi-camera-stage {
+            min-height: 180px;
+            aspect-ratio: 4 / 3;
+        }
+
+        .pi-camera-stage img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+
+        .pi-camera-settings {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .pi-camera-options {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .checkbox-field {
+            min-height: 50px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 0 12px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text);
+            font-weight: 700;
+        }
+
+        .pi-camera-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .pi-camera-preview-options {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .pi-camera-preview-options .checkbox-field {
+            min-height: 38px;
+            padding: 0 10px;
+            font-size: 0.88rem;
+        }
+
         .action-dock {
             position: sticky;
             bottom: max(12px, env(safe-area-inset-bottom));
@@ -647,7 +724,7 @@
         }
 
         @media (max-width: 720px) {
-            .settings-grid, .sequence-grid { grid-template-columns: 1fr; }
+            .settings-grid, .sequence-grid, .pi-camera-settings, .pi-camera-options, .pi-camera-actions { grid-template-columns: 1fr; }
             .field-row { display: grid; }
             .sequence-meta {
                 align-items: stretch;
@@ -729,6 +806,97 @@
                 </button>
             </div>
         </section>
+
+        <details class="panel" id="piCameraDetails" hidden>
+            <summary>Pi Camera</summary>
+            <div class="details-body">
+                <div class="preview-stage pi-camera-stage">
+                    <img id="piCameraPreview" alt="Pi camera preview" draggable="false">
+                    <div id="piCameraPreviewEmpty" class="preview-empty">Preview unavailable.</div>
+                </div>
+                <div class="preview-meta" id="piCameraStatus">Camera ready</div>
+                <div class="pi-camera-preview-options">
+                    <label class="checkbox-field" for="piCameraPreviewManual">
+                        <input id="piCameraPreviewManual" type="checkbox">
+                        <span>Manual Preview</span>
+                    </label>
+                </div>
+                <div class="pi-camera-actions">
+                    <button id="piCameraRecordBtn" type="button" class="primary">Record</button>
+                    <a id="piCameraLastLink" class="link-button" href="#" target="_blank" rel="noreferrer" hidden>Last Capture</a>
+                </div>
+                <section class="pi-camera-settings">
+                    <div class="field">
+                        <label for="piCameraResolutionSelect">Resolution</label>
+                        <select id="piCameraResolutionSelect"></select>
+                    </div>
+                    <div class="field">
+                        <label for="piCameraModeSelect">Mode</label>
+                        <select id="piCameraModeSelect">
+                            <option value="add">Additive</option>
+                            <option value="lighten">Lighten</option>
+                            <option value="mean">Mean</option>
+                            <option value="screen">Screen</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="piCameraDurationRange">
+                            <span>Duration</span>
+                            <span id="piCameraDurationValue" class="range-value">30s</span>
+                        </label>
+                        <input id="piCameraDurationRange" type="range" min="1" max="600" step="1" value="30">
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="piCameraFrameGapRange">
+                            <span>Frame Gap</span>
+                            <span id="piCameraFrameGapValue" class="range-value">0.00s</span>
+                        </label>
+                        <input id="piCameraFrameGapRange" type="range" min="0" max="4" step="0.01" value="0">
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="piCameraThresholdRange">
+                            <span>Threshold</span>
+                            <span id="piCameraThresholdValue" class="range-value">10</span>
+                        </label>
+                        <input id="piCameraThresholdRange" type="range" min="0" max="255" step="1" value="10">
+                    </div>
+                    <div class="field">
+                        <label class="checkbox-field" for="piCameraManualExposure">
+                            <input id="piCameraManualExposure" type="checkbox" checked>
+                            <span>Manual Exposure</span>
+                        </label>
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="piCameraShutterRange">
+                            <span>Shutter</span>
+                            <span id="piCameraShutterValue" class="range-value">1.00s</span>
+                        </label>
+                        <input id="piCameraShutterRange" type="range" min="0.01" max="4.8" step="0.01" value="1">
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="piCameraIsoRange">
+                            <span>ISO</span>
+                            <span id="piCameraIsoValue" class="range-value">100</span>
+                        </label>
+                        <input id="piCameraIsoRange" type="range" min="100" max="6350" step="50" value="100">
+                    </div>
+                    <div class="field">
+                        <label for="piCameraApertureInput">Aperture</label>
+                        <input id="piCameraApertureInput" type="text" value="Fixed" disabled>
+                    </div>
+                </section>
+                <section class="pi-camera-options">
+                    <label class="checkbox-field" for="piCameraTriggerLift">
+                        <input id="piCameraTriggerLift" type="checkbox">
+                        <span>Start Lift</span>
+                    </label>
+                    <label class="checkbox-field" for="piCameraStopAfter">
+                        <input id="piCameraStopAfter" type="checkbox">
+                        <span>Stop After</span>
+                    </label>
+                </section>
+            </div>
+        </details>
 
         <details class="panel" id="previewDetails">
             <summary>Preview</summary>
@@ -886,6 +1054,28 @@
         const runStatus = $("#runStatus");
         const runStatusText = $("#runStatusText");
         const cameraLink = $("#cameraLink");
+        const piCameraDetails = $("#piCameraDetails");
+        const piCameraPreview = $("#piCameraPreview");
+        const piCameraPreviewEmpty = $("#piCameraPreviewEmpty");
+        const piCameraStatus = $("#piCameraStatus");
+        const piCameraPreviewManual = $("#piCameraPreviewManual");
+        const piCameraResolutionSelect = $("#piCameraResolutionSelect");
+        const piCameraModeSelect = $("#piCameraModeSelect");
+        const piCameraDurationRange = $("#piCameraDurationRange");
+        const piCameraDurationValue = $("#piCameraDurationValue");
+        const piCameraFrameGapRange = $("#piCameraFrameGapRange");
+        const piCameraFrameGapValue = $("#piCameraFrameGapValue");
+        const piCameraThresholdRange = $("#piCameraThresholdRange");
+        const piCameraThresholdValue = $("#piCameraThresholdValue");
+        const piCameraManualExposure = $("#piCameraManualExposure");
+        const piCameraShutterRange = $("#piCameraShutterRange");
+        const piCameraShutterValue = $("#piCameraShutterValue");
+        const piCameraIsoRange = $("#piCameraIsoRange");
+        const piCameraIsoValue = $("#piCameraIsoValue");
+        const piCameraTriggerLift = $("#piCameraTriggerLift");
+        const piCameraStopAfter = $("#piCameraStopAfter");
+        const piCameraRecordBtn = $("#piCameraRecordBtn");
+        const piCameraLastLink = $("#piCameraLastLink");
 
         let currentState = null;
         let currentSequence = null;
@@ -895,14 +1085,234 @@
         let suppressFormSyncUntil = 0;
         let targetDebounce = null;
         let speedDebounce = null;
+        let piCameraPreviewTimer = null;
+        let piCameraLimitsApplied = false;
+        let piCameraLimits = null;
 
         const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
         const frameIndexForPosition = (frameCount, pct) => !frameCount || frameCount <= 1 ? 0 : Math.min(frameCount - 1, Math.round((clamp(pct, 0, 100) / 100) * (frameCount - 1)));
+        const fallbackPiCameraLimits = {
+            default_capture_mode: "1296x972",
+            capture_modes: [
+                { key: "640x480", label: "640 x 480", width: 640, height: 480, max_fps: 58.92 },
+                { key: "1296x972", label: "1296 x 972", width: 1296, height: 972, max_fps: 46.34 },
+                { key: "1920x1080", label: "1920 x 1080", width: 1920, height: 1080, max_fps: 32.81 },
+                { key: "2592x1944", label: "2592 x 1944", width: 2592, height: 1944, max_fps: 15.63 }
+            ],
+            blend_modes: [
+                { value: "add", label: "Additive" },
+                { value: "lighten", label: "Lighten" },
+                { value: "mean", label: "Mean" },
+                { value: "screen", label: "Screen" }
+            ],
+            duration_sec: { min: 1, max: 600, step: 1, default: 30 },
+            frame_gap_sec: { min: 0, max: 4, step: 0.01, default: 0 },
+            shutter_sec: { min: 0.01, max: 4.8, step: 0.01, default: 1 },
+            iso: { min: 100, max: 6350, step: 50, default: 100 },
+            threshold: { min: 0, max: 255, step: 1, default: 10 }
+        };
 
         function setPreviewMode(mode) {
             previewImage.style.display = mode === "image" ? "block" : "none";
             previewVideo.style.display = mode === "video" ? "block" : "none";
             previewEmpty.style.display = mode === "empty" ? "flex" : "none";
+        }
+
+        function setPiCameraPreviewMode(mode) {
+            piCameraPreview.style.display = mode === "image" ? "block" : "none";
+            piCameraPreviewEmpty.style.display = mode === "empty" ? "flex" : "none";
+        }
+
+        function formatRangeValue(value) {
+            return String(Number(value.toFixed(3))).replace(/\.0$/, "");
+        }
+
+        function setRangeLimits(range, config) {
+            range.min = formatRangeValue(Number(config.min));
+            range.max = formatRangeValue(Number(config.max));
+            range.step = formatRangeValue(Number(config.step));
+            if (!piCameraLimitsApplied) {
+                range.value = formatRangeValue(Number(config.default));
+            }
+        }
+
+        function populatePiCameraSelect(select, items, selectedValue) {
+            const current = select.value || selectedValue;
+            select.innerHTML = items.map((item) => {
+                const value = item.key || item.value;
+                const label = item.label || value;
+                const selected = value === current ? " selected" : "";
+                return `<option value="${value}"${selected}>${label}</option>`;
+            }).join("");
+            if ([...select.options].some((option) => option.value === current)) {
+                select.value = current;
+            } else if (select.options.length) {
+                select.selectedIndex = 0;
+            }
+        }
+
+        function applyPiCameraLimits(limits) {
+            piCameraLimits = { ...fallbackPiCameraLimits, ...(limits || {}) };
+            if (!piCameraLimitsApplied) {
+                populatePiCameraSelect(
+                    piCameraResolutionSelect,
+                    piCameraLimits.capture_modes,
+                    piCameraLimits.default_capture_mode
+                );
+                populatePiCameraSelect(piCameraModeSelect, piCameraLimits.blend_modes, "add");
+                setRangeLimits(piCameraDurationRange, piCameraLimits.duration_sec);
+                setRangeLimits(piCameraFrameGapRange, piCameraLimits.frame_gap_sec);
+                setRangeLimits(piCameraThresholdRange, piCameraLimits.threshold);
+                setRangeLimits(piCameraShutterRange, piCameraLimits.shutter_sec);
+                setRangeLimits(piCameraIsoRange, piCameraLimits.iso);
+                piCameraLimitsApplied = true;
+            }
+            syncPiCameraSliders();
+        }
+
+        function selectedPiCameraMode() {
+            const limits = piCameraLimits || fallbackPiCameraLimits;
+            return limits.capture_modes.find((mode) => mode.key === piCameraResolutionSelect.value)
+                || limits.capture_modes[0]
+                || fallbackPiCameraLimits.capture_modes[0];
+        }
+
+        function syncPiCameraSliders() {
+            const limits = piCameraLimits || fallbackPiCameraLimits;
+            const captureMode = selectedPiCameraMode();
+            const manual = piCameraManualExposure.checked;
+            const shutterMin = Number(limits.shutter_sec.min);
+            const shutterMax = Number(limits.shutter_sec.max);
+            const baseIntervalMin = 1 / Number(captureMode.max_fps);
+
+            let shutter = clamp(Number(piCameraShutterRange.value), shutterMin, shutterMax);
+            piCameraShutterRange.value = formatRangeValue(shutter);
+            piCameraShutterRange.disabled = !manual || piCameraRecordBtn.disabled;
+            piCameraIsoRange.disabled = !manual || piCameraRecordBtn.disabled;
+
+            const requestedGap = clamp(
+                Number(piCameraFrameGapRange.value),
+                Number(limits.frame_gap_sec.min),
+                Number(limits.frame_gap_sec.max)
+            );
+            piCameraFrameGapRange.value = formatRangeValue(requestedGap);
+            const effectiveInterval = manual ? Math.max(baseIntervalMin, shutter + requestedGap) : Math.max(baseIntervalMin, requestedGap);
+            const effectiveGap = manual ? Math.max(0, effectiveInterval - shutter) : Math.max(0, effectiveInterval);
+
+            piCameraDurationValue.textContent = `${Math.round(Number(piCameraDurationRange.value))}s`;
+            piCameraFrameGapValue.textContent = `${requestedGap.toFixed(2)}s`;
+            piCameraThresholdValue.textContent = String(Math.round(Number(piCameraThresholdRange.value)));
+            piCameraShutterValue.textContent = manual
+                ? `${Number(piCameraShutterRange.value).toFixed(2)}s + ${effectiveGap.toFixed(2)}s gap`
+                : "Auto";
+            piCameraIsoValue.textContent = manual ? String(Math.round(Number(piCameraIsoRange.value))) : "Auto";
+        }
+
+        function stopPiCameraPreview() {
+            if (piCameraPreviewTimer) {
+                clearTimeout(piCameraPreviewTimer);
+                piCameraPreviewTimer = null;
+            }
+        }
+
+        function schedulePiCameraPreview(delayMs = 0) {
+            if (piCameraPreviewTimer) return;
+            piCameraPreviewTimer = setTimeout(() => {
+                piCameraPreviewTimer = null;
+                refreshPiCameraPreview();
+            }, delayMs);
+        }
+
+        function restartPiCameraPreview(delayMs = 0) {
+            stopPiCameraPreview();
+            piCameraPreview.removeAttribute("src");
+            schedulePiCameraPreview(delayMs);
+        }
+
+        function refreshPiCameraPreview() {
+            const camera = currentState && currentState.pi_camera;
+            if (!camera || !camera.available || camera.busy || !piCameraDetails.open || piCameraDetails.hidden) {
+                stopPiCameraPreview();
+                return;
+            }
+            const previewUsesManual = piCameraPreviewManual.checked && piCameraManualExposure.checked;
+            const params = new URLSearchParams({
+                t: String(Date.now()),
+                manual_exposure: previewUsesManual ? "true" : "false"
+            });
+            if (previewUsesManual) {
+                params.set("shutter_sec", String(Number(piCameraShutterRange.value)));
+                params.set("iso", String(Math.round(Number(piCameraIsoRange.value))));
+            }
+            piCameraPreview.src = `/pi-camera/preview.jpg?${params.toString()}`;
+        }
+
+        function formatPiCameraStatus(camera) {
+            if (!camera || !camera.available) return "";
+            if (camera.busy && camera.job) {
+                const frames = Number(camera.job.frame_count || 0);
+                const remaining = Number(camera.job.remaining_sec || 0);
+                return `Recording ${frames} frames | ${formatTimer(remaining)} left`;
+            }
+            if (camera.last_error) return `Error: ${camera.last_error}`;
+            if (camera.last_capture_url) {
+                const frames = Number(camera.last_frame_count || 0);
+                return frames > 0 ? `Ready | Last capture saved (${frames} frames)` : "Ready | Last capture saved";
+            }
+            return camera.label ? `${camera.label} ready` : "Camera ready";
+        }
+
+        function setPiCameraControlsDisabled(disabled) {
+            for (const control of [
+                piCameraResolutionSelect,
+                piCameraModeSelect,
+                piCameraDurationRange,
+                piCameraFrameGapRange,
+                piCameraThresholdRange,
+                piCameraPreviewManual,
+                piCameraManualExposure,
+                piCameraShutterRange,
+                piCameraIsoRange,
+                piCameraTriggerLift,
+                piCameraStopAfter,
+                piCameraRecordBtn
+            ]) {
+                control.disabled = disabled;
+            }
+            if (!disabled) syncPiCameraSliders();
+        }
+
+        function renderPiCamera(state) {
+            const camera = state.pi_camera || { available: false };
+            piCameraDetails.hidden = !camera.available;
+            if (!camera.available) {
+                stopPiCameraPreview();
+                setPiCameraPreviewMode("empty");
+                return;
+            }
+
+            applyPiCameraLimits(camera.limits);
+            const busy = Boolean(camera.busy);
+            setPiCameraControlsDisabled(busy);
+            piCameraRecordBtn.textContent = busy ? "Recording..." : "Record";
+            piCameraStatus.textContent = formatPiCameraStatus(camera);
+            piCameraLastLink.hidden = !camera.last_capture_url;
+            if (camera.last_capture_url) {
+                piCameraLastLink.href = camera.last_capture_url;
+            }
+
+            if (busy) {
+                stopPiCameraPreview();
+                setPiCameraPreviewMode("empty");
+                piCameraPreviewEmpty.textContent = "Recording...";
+            } else {
+                piCameraPreviewEmpty.textContent = "Preview unavailable.";
+                if (piCameraDetails.open) {
+                    schedulePiCameraPreview(0);
+                } else {
+                    stopPiCameraPreview();
+                }
+            }
         }
 
         function motionLabel(state) {
@@ -1200,6 +1610,7 @@
             if (state.camera_url) {
                 cameraLink.href = state.camera_url;
             }
+            renderPiCamera(state);
             if (targetRange.disabled !== state.is_cycling) {
                 targetRange.disabled = state.is_cycling;
                 if (state.is_cycling) {
@@ -1313,7 +1724,7 @@
             try {
                 const state = await apiGet("/api/state");
                 await applyState(state);
-                nextPollMs = state.is_moving || state.is_cycling || state.countdown_remaining > 0 || state.switch_direction !== 0 ? 300 : 1000;
+                nextPollMs = state.is_moving || state.is_cycling || state.countdown_remaining > 0 || state.switch_direction !== 0 || (state.pi_camera && state.pi_camera.busy) ? 300 : 1000;
             } catch (error) {
                 modePill.textContent = "Offline";
                 countdownPill.textContent = "Retrying";
@@ -1332,6 +1743,41 @@
         async function pushSettings(payload) {
             const result = await apiPost("/api/settings", payload);
             if (result.state) await applyState(result.state);
+        }
+
+        async function startPiCameraRecord() {
+            stopPiCameraPreview();
+            piCameraPreview.removeAttribute("src");
+            setPiCameraPreviewMode("empty");
+            syncPiCameraSliders();
+            const manualExposure = piCameraManualExposure.checked;
+            const duration = Math.round(Number(piCameraDurationRange.value));
+            const frameGapSec = Number(piCameraFrameGapRange.value);
+            const threshold = Math.round(Number(piCameraThresholdRange.value));
+            const shutterSec = manualExposure ? Number(piCameraShutterRange.value) : null;
+            const iso = manualExposure ? Math.round(Number(piCameraIsoRange.value)) : null;
+
+            piCameraStatus.textContent = "Starting recording...";
+            piCameraRecordBtn.disabled = true;
+
+            const result = await apiPost("/api/pi-camera/record", {
+                duration,
+                capture_mode: piCameraResolutionSelect.value,
+                mode: piCameraModeSelect.value,
+                threshold,
+                frame_gap_sec: frameGapSec,
+                quality: 92,
+                manual_exposure: manualExposure,
+                shutter_sec: shutterSec,
+                iso,
+                trigger_lift: piCameraTriggerLift.checked,
+                stop_after: piCameraStopAfter.checked
+            });
+
+            if (currentState && result.pi_camera) {
+                currentState.pi_camera = result.pi_camera;
+                renderPiCamera(currentState);
+            }
         }
 
         function bindJogButton(button, direction) {
@@ -1426,6 +1872,46 @@
         cycleBtn.addEventListener("click", async () => { await postAction("cycle_toggle"); });
         $("#homeBtn").addEventListener("click", async () => { if (window.confirm("Retract fully to zero the lift?")) await postAction("home"); });
         $("#stopBtn").addEventListener("click", async () => { await postAction("stop"); });
+        for (const control of [
+            piCameraResolutionSelect,
+            piCameraDurationRange,
+            piCameraFrameGapRange,
+            piCameraThresholdRange,
+            piCameraManualExposure,
+            piCameraShutterRange,
+            piCameraIsoRange
+        ]) {
+            control.addEventListener("input", syncPiCameraSliders);
+            control.addEventListener("change", syncPiCameraSliders);
+        }
+        for (const control of [
+            piCameraPreviewManual,
+            piCameraManualExposure,
+            piCameraShutterRange,
+            piCameraIsoRange
+        ]) {
+            control.addEventListener("input", () => restartPiCameraPreview(250));
+            control.addEventListener("change", () => restartPiCameraPreview(0));
+        }
+        piCameraDetails.addEventListener("toggle", () => {
+            if (currentState) renderPiCamera(currentState);
+        });
+        piCameraPreview.addEventListener("load", () => {
+            setPiCameraPreviewMode("image");
+            schedulePiCameraPreview(5000);
+        });
+        piCameraPreview.addEventListener("error", () => {
+            setPiCameraPreviewMode("empty");
+            schedulePiCameraPreview(7000);
+        });
+        piCameraRecordBtn.addEventListener("click", async () => {
+            try {
+                await startPiCameraRecord();
+            } catch (error) {
+                piCameraStatus.textContent = error.message || "Recording failed";
+                piCameraRecordBtn.disabled = false;
+            }
+        });
 
         previewVideo.addEventListener("loadedmetadata", renderPreview);
         previewVideo.addEventListener("seeked", renderPreview);

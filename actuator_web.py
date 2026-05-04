@@ -23,6 +23,22 @@ try:
 except Exception:  # pragma: no cover
     gpiod = None
 
+try:
+    from experiments.pi_long_exposure.pi_camera_runtime import (
+        CameraBusyError,
+        CameraUnavailableError,
+        PiCameraRuntime,
+        RecordSettings,
+    )
+except Exception as exc:  # pragma: no cover - optional experiment may be removed
+    CameraBusyError = RuntimeError  # type: ignore
+    CameraUnavailableError = RuntimeError  # type: ignore
+    PiCameraRuntime = None  # type: ignore
+    RecordSettings = None  # type: ignore
+    PI_CAMERA_IMPORT_ERROR = str(exc)
+else:
+    PI_CAMERA_IMPORT_ERROR = None
+
 
 CHIPPATH = "/dev/gpiochip0"
 RPWM = 18
@@ -1167,6 +1183,7 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
     server_version = "TimeVolumeActuator/1.0"
     protocol_version = "HTTP/1.1"
     controller: InstallationController | None = None
+    pi_camera: Any = None
 
     def do_HEAD(self) -> None:
         self._handle_request(head_only=True)
@@ -1181,6 +1198,9 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/action":
             self._handle_action_post()
+            return
+        if parsed.path == "/api/pi-camera/record":
+            self._handle_pi_camera_record_post()
             return
         self._json_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -1198,8 +1218,16 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             self._serve_file(WEB_DIR / "display.html", cache_control="no-store", head_only=head_only)
             return
         if path == "/api/state":
-            controller = self._require_controller()
-            self._send_json(controller.get_state(), head_only=head_only)
+            self._send_json(self._controller_state(), head_only=head_only)
+            return
+        if path == "/api/pi-camera/state":
+            self._send_json({"pi_camera": self._pi_camera_state()}, head_only=head_only)
+            return
+        if path == "/pi-camera/preview.jpg":
+            self._serve_pi_camera_preview(parsed, head_only=head_only)
+            return
+        if path.startswith("/pi-camera/captures/"):
+            self._serve_pi_camera_capture(path, head_only=head_only)
             return
         if path == "/api/library":
             controller = self._require_controller()
@@ -1248,7 +1276,7 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json_error(HTTPStatus.BAD_REQUEST, f"Invalid settings payload: {exc}")
             return
-        self._send_json({"state": state})
+        self._send_json({"state": self._with_pi_camera_state(state)})
 
     def _handle_action_post(self) -> None:
         controller = self._require_controller()
@@ -1285,7 +1313,64 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Action failed: {exc}")
             return
 
-        self._send_json({"state": controller.get_state()})
+        self._send_json({"state": self._controller_state()})
+
+    def _handle_pi_camera_record_post(self) -> None:
+        runtime = self.pi_camera
+        if runtime is None or RecordSettings is None:
+            self._json_error(HTTPStatus.NOT_FOUND, PI_CAMERA_IMPORT_ERROR or "Pi camera experiment is not installed")
+            return
+
+        try:
+            payload = self._read_json_body()
+            settings = RecordSettings.from_payload(payload)
+            state = runtime.start_recording(settings, self._run_camera_action)
+        except ValueError as exc:
+            self._json_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except CameraUnavailableError as exc:
+            self._json_error(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        except CameraBusyError as exc:
+            self._json_error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except Exception as exc:
+            self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Pi camera record failed: {exc}")
+            return
+
+        self._send_json({"pi_camera": state})
+
+    def _run_camera_action(self, action: str) -> None:
+        controller = self._require_controller()
+        if action == "play_pause":
+            controller.play_pause()
+            return
+        if action == "stop":
+            controller.stop_all()
+            return
+        raise ValueError(f"Unsupported Pi camera action: {action}")
+
+    def _controller_state(self) -> dict[str, Any]:
+        controller = self._require_controller()
+        return self._with_pi_camera_state(controller.get_state())
+
+    def _with_pi_camera_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        state["pi_camera"] = self._pi_camera_state()
+        return state
+
+    def _pi_camera_state(self) -> dict[str, Any]:
+        runtime = self.pi_camera
+        if runtime is None:
+            return {
+                "available": False,
+                "label": None,
+                "reason": PI_CAMERA_IMPORT_ERROR or "Pi camera experiment is not installed",
+                "busy": False,
+                "job": None,
+                "last_capture_url": None,
+                "last_error": None,
+            }
+        return runtime.get_state()
 
     def _require_controller(self) -> InstallationController:
         if self.controller is None:
@@ -1320,6 +1405,59 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _serve_pi_camera_preview(self, parsed: Any, head_only: bool) -> None:
+        runtime = self.pi_camera
+        if runtime is None:
+            self._json_error(HTTPStatus.NOT_FOUND, PI_CAMERA_IMPORT_ERROR or "Pi camera experiment is not installed")
+            return
+
+        try:
+            params = parse_qs(parsed.query)
+            preview_manual = str(params.get("manual_exposure", ["false"])[0]).lower() in {"1", "true", "yes", "on", "manual"}
+            payload: dict[str, Any] = {
+                "capture_mode": "640x480",
+                "manual_exposure": preview_manual,
+                "frame_gap_sec": 0,
+            }
+            if preview_manual:
+                payload["shutter_sec"] = params.get("shutter_sec", [None])[0]
+                payload["iso"] = params.get("iso", [None])[0]
+            settings = RecordSettings.from_payload(payload) if RecordSettings is not None else None
+            body = b"" if head_only else runtime.capture_preview_jpeg(settings=settings)
+        except ValueError as exc:
+            self._json_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except CameraUnavailableError as exc:
+            self._json_error(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        except CameraBusyError as exc:
+            self._json_error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except Exception as exc:
+            self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Pi camera preview failed: {exc}")
+            return
+
+        if head_only:
+            body = b""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _serve_pi_camera_capture(self, request_path: str, head_only: bool) -> None:
+        runtime = self.pi_camera
+        if runtime is None:
+            self._json_error(HTTPStatus.NOT_FOUND, PI_CAMERA_IMPORT_ERROR or "Pi camera experiment is not installed")
+            return
+        file_path = runtime.capture_path_for_request(request_path)
+        if not file_path:
+            self._json_error(HTTPStatus.NOT_FOUND, "Pi camera capture not found")
+            return
+        self._serve_file(file_path, cache_control="no-store", head_only=head_only)
 
     def _serve_camera_asset(self, request_path: str, head_only: bool) -> None:
         relative = unquote(request_path[len("/camera/") :]).replace("\\", "/")
@@ -1504,6 +1642,11 @@ def main() -> None:
     req = request_gpio_lines(require_gpio=args.require_gpio)
     controller = InstallationController(req)
     ActuatorRequestHandler.controller = controller
+    ActuatorRequestHandler.pi_camera = (
+        PiCameraRuntime(BASE_DIR / "experiments" / "pi_long_exposure" / "captures")
+        if PiCameraRuntime is not None
+        else None
+    )
     server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
 
     print_launch_hints(args.host, args.port)

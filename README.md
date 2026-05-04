@@ -27,6 +27,12 @@ Camera access from phones/tablets usually requires HTTPS, except on `localhost`.
 If the camera PWA opens but cannot initialize the camera over a Pi LAN address,
 serve the app through HTTPS or a trusted local tunnel.
 
+For the Pi kiosk flow, run:
+
+```bash
+./start_time_volume.sh
+```
+
 ## Camera App
 
 The camera app is hosted separately on GitHub Pages:
@@ -51,11 +57,15 @@ For the boot service, pass the override while installing:
 sudo env TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./install_boot_service.sh
 ```
 
-For the Pi kiosk flow, run:
+## Pi Camera Long Exposure Experiment
 
-```bash
-./start_time_volume.sh
-```
+A removable hardware-camera experiment lives in `experiments/pi_long_exposure/`.
+It uses the attached Raspberry Pi camera to stack frames into a saved
+long-exposure-style image and can optionally trigger the existing actuator API.
+When the Pi camera is detected, the controller shows a collapsible Pi Camera
+panel with preview, recording, and basic capture settings, including optional
+manual shutter and ISO-like gain. If the experiment folder or camera is missing,
+the panel stays hidden.
 
 ## Boot Switch Control
 
@@ -85,6 +95,7 @@ These are generated while the installation runs and should not be treated as sou
 - `actuator_state.json`
 - `*.log`
 - `*.tmp`
+- `experiments/pi_long_exposure/captures/`
 
 ## Cleanup Notes
 
