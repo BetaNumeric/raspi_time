@@ -182,13 +182,101 @@
         let canvasRevision = 0;
         let lastRenderedAssetKey = null;
         let lastRenderedCanvasRevision = -1;
+        let lastStateReceivedAtMs = performance.now();
+        let renderLoopId = null;
+        let lastPreloadCenterIndex = null;
+        let lastPreloadDirection = 0;
 
-        const IMAGE_PRELOAD_RADIUS = 3;
-        const IMAGE_CACHE_LIMIT = 48;
+        const IMAGE_PRELOAD_IDLE_RADIUS = 10;
+        const IMAGE_PRELOAD_BEHIND = 8;
+        const IMAGE_PRELOAD_AHEAD = 64;
+        const IMAGE_PRELOAD_MIN_STEP = 6;
+        const IMAGE_CACHE_LIMIT = 120;
+        const NEAREST_LOADED_RADIUS = 32;
         const imageCache = new Map();
 
+        const DEFAULT_LIFT_STROKE_CM = 48;
+        const MIN_SEQUENCE_HEIGHT_CM = 0.01;
+        const DEFAULT_EXTEND_SEC = 23.75;
+        const DEFAULT_RETRACT_SEC = 22.0;
+        const MAX_SEQUENCE_PLAYBACK_FPS = 30;
         const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
-        const frameIndexForPosition = (frameCount, pct) => !frameCount || frameCount <= 1 ? 0 : Math.min(frameCount - 1, Math.round((clamp(pct, 0, 100) / 100) * (frameCount - 1)));
+
+        function sequenceSpan(sequence) {
+            const strokeCm = Math.max(
+                MIN_SEQUENCE_HEIGHT_CM,
+                Number(sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM)
+            );
+            const startCm = clamp(Number(sequence.start_cm || 0), 0, strokeCm - MIN_SEQUENCE_HEIGHT_CM);
+            const configuredEndCm = Number(sequence.end_cm);
+            const fallbackHeightCm = Number(sequence.volume_height_cm || strokeCm);
+            const endCm = Number.isFinite(configuredEndCm)
+                ? clamp(configuredEndCm, startCm + MIN_SEQUENCE_HEIGHT_CM, strokeCm)
+                : clamp(startCm + fallbackHeightCm, startCm + MIN_SEQUENCE_HEIGHT_CM, strokeCm);
+            return { strokeCm, startCm, endCm, heightCm: endCm - startCm };
+        }
+
+        function playbackRatioForPosition(sequence, pct) {
+            const { strokeCm, startCm, endCm } = sequenceSpan(sequence);
+            const positionCm = (clamp(Number(pct || 0), 0, 100) / 100) * strokeCm;
+
+            if (positionCm < startCm) {
+                return sequence.outside_playback === "hold" ? 0 : null;
+            }
+            if (positionCm > endCm) {
+                return sequence.outside_playback === "hold" ? 1 : null;
+            }
+            return clamp((positionCm - startCm) / (endCm - startCm), 0, 1);
+        }
+
+        function frameRateLimitForSequence(sequence, direction = 1, state = currentState) {
+            if (!sequence || !sequence.frame_count || sequence.frame_count <= 1) {
+                return { requestedFps: 0, effectiveFps: 0, stride: 1, durationSec: 0 };
+            }
+
+            const { strokeCm, heightCm } = sequenceSpan(sequence);
+            const travelDirection = direction < 0 ? -1 : 1;
+            const strokeSec = travelDirection > 0
+                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC)
+                : Number(state?.retract_sec || DEFAULT_RETRACT_SEC);
+            const duty = clamp(Number(state?.speed_duty || 1), 0.1, 1);
+            const durationSec = ((heightCm / strokeCm) * Math.max(0.01, strokeSec)) / duty;
+            const requestedFps = (Number(sequence.frame_count) - 1) / Math.max(0.01, durationSec);
+            const stride = Math.max(1, Math.ceil(requestedFps / MAX_SEQUENCE_PLAYBACK_FPS));
+            return {
+                requestedFps,
+                effectiveFps: requestedFps / stride,
+                stride,
+                durationSec
+            };
+        }
+
+        function quantizeFrameIndex(index, frameCount, stride) {
+            if (stride <= 1 || frameCount <= 1) return index;
+            const lastIndex = frameCount - 1;
+            if (index <= 0) return 0;
+            if (index >= lastIndex) return lastIndex;
+            return clamp(Math.round(index / stride) * stride, 0, lastIndex);
+        }
+
+        function frameIndexForSequencePosition(sequence, pct, direction = 1) {
+            if (!sequence) return { index: 0, rawIndex: 0, stride: 1 };
+            const ratio = playbackRatioForPosition(sequence, pct);
+            if (ratio == null) return null;
+            if (!sequence.frame_count || sequence.frame_count <= 1) {
+                return { index: 0, rawIndex: 0, stride: 1 };
+            }
+            const frameCount = Number(sequence.frame_count);
+            const rawIndex = Math.min(frameCount - 1, Math.round(ratio * (frameCount - 1)));
+            const limit = frameRateLimitForSequence(sequence, direction, currentState);
+            return {
+                index: quantizeFrameIndex(rawIndex, frameCount, limit.stride),
+                rawIndex,
+                stride: limit.stride,
+                requestedFps: limit.requestedFps,
+                effectiveFps: limit.effectiveFps
+            };
+        }
 
         function resizeCanvas() {
             const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -247,6 +335,8 @@
             lastDrawnImageUrl = null;
             lastRenderedAssetKey = null;
             lastRenderedCanvasRevision = -1;
+            lastPreloadCenterIndex = null;
+            lastPreloadDirection = 0;
         }
 
         function rememberImage(url, entry) {
@@ -276,18 +366,29 @@
                 if (cachedEntry.loaded && cachedEntry.image.naturalWidth) {
                     if (onLoad) onLoad(cachedEntry.image);
                 } else if (onLoad) {
-                    cachedEntry.image.addEventListener("load", () => onLoad(cachedEntry.image), { once: true });
+                    cachedEntry.callbacks.push(onLoad);
                 }
                 return cachedEntry.image;
             }
 
             const image = new Image();
-            const entry = { image, loaded: false };
+            const entry = { image, loaded: false, callbacks: onLoad ? [onLoad] : [] };
             image.decoding = "async";
             image.loading = "eager";
             image.addEventListener("load", () => {
-                entry.loaded = true;
-                if (onLoad) onLoad(image);
+                const finish = () => {
+                    entry.loaded = true;
+                    const callbacks = entry.callbacks.splice(0);
+                    for (const callback of callbacks) {
+                        callback(image);
+                    }
+                    scheduleRender();
+                };
+                if (image.decode) {
+                    image.decode().then(finish).catch(finish);
+                } else {
+                    finish();
+                }
             }, { once: true });
             image.addEventListener("error", () => {
                 imageCache.delete(url);
@@ -297,15 +398,76 @@
             return image;
         }
 
-        function preloadNearbyFrames(centerIndex) {
+        function loadedImageForFrame(index) {
+            if (!currentSequence || currentSequence.kind !== "images") {
+                return null;
+            }
+            const url = currentSequence.frame_urls[index];
+            if (!url) {
+                return null;
+            }
+            const entry = getImageCacheEntry(url);
+            if (entry && entry.loaded && entry.image.naturalWidth) {
+                return { image: entry.image, url, index };
+            }
+            return null;
+        }
+
+        function nearestLoadedFrame(centerIndex, direction = 0, stride = 1) {
+            const exact = loadedImageForFrame(centerIndex);
+            if (exact) {
+                return exact;
+            }
+
+            const step = Math.max(1, stride);
+            const maxOffset = Math.max(NEAREST_LOADED_RADIUS, step * 4);
+            for (let offset = step; offset <= maxOffset; offset += step) {
+                const firstIndex = direction < 0 ? centerIndex + offset : centerIndex - offset;
+                const secondIndex = direction < 0 ? centerIndex - offset : centerIndex + offset;
+                const first = firstIndex >= 0 && firstIndex < currentSequence.frame_count
+                    ? loadedImageForFrame(firstIndex)
+                    : null;
+                if (first) {
+                    return first;
+                }
+                const second = secondIndex >= 0 && secondIndex < currentSequence.frame_count
+                    ? loadedImageForFrame(secondIndex)
+                    : null;
+                if (second) {
+                    return second;
+                }
+            }
+
+            return null;
+        }
+
+        function preloadNearbyFrames(centerIndex, direction = 0, stride = 1) {
             if (!currentSequence || currentSequence.kind !== "images") {
                 return;
             }
 
-            const start = Math.max(0, centerIndex - IMAGE_PRELOAD_RADIUS);
-            const end = Math.min(currentSequence.frame_count - 1, centerIndex + IMAGE_PRELOAD_RADIUS);
+            const step = Math.max(1, stride);
+            if (
+                lastPreloadCenterIndex != null
+                && lastPreloadDirection === direction
+                && Math.abs(centerIndex - lastPreloadCenterIndex) < Math.max(IMAGE_PRELOAD_MIN_STEP, step)
+            ) {
+                return;
+            }
 
-            for (let index = start; index <= end; index += 1) {
+            lastPreloadCenterIndex = centerIndex;
+            lastPreloadDirection = direction;
+
+            const behind = direction === 0 ? IMAGE_PRELOAD_IDLE_RADIUS : IMAGE_PRELOAD_BEHIND;
+            const ahead = direction === 0 ? IMAGE_PRELOAD_IDLE_RADIUS : IMAGE_PRELOAD_AHEAD;
+            const start = Math.max(0, centerIndex - (direction < 0 ? ahead : behind));
+            const end = Math.min(currentSequence.frame_count - 1, centerIndex + (direction < 0 ? behind : ahead));
+            const firstIndex = Math.max(0, Math.floor(start / step) * step);
+
+            for (let index = firstIndex; index <= end; index += step) {
+                if (index < start) {
+                    continue;
+                }
                 const url = currentSequence.frame_urls[index];
                 if (url) {
                     requestImage(url);
@@ -320,6 +482,86 @@
             if (state.is_moving && state.is_paused) return "Paused";
             if (state.is_moving) return "Moving";
             return "Idle";
+        }
+
+        function syncSequenceMetadataFromState(sequence, state) {
+            if (!sequence || !state || sequence.id !== state.selected_sequence_id) {
+                return;
+            }
+            sequence.lift_stroke_cm = state.lift_stroke_cm || sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM;
+            sequence.start_cm = state.selected_sequence_start_cm ?? sequence.start_cm ?? 0;
+            sequence.end_cm = state.selected_sequence_end_cm ?? sequence.end_cm;
+            sequence.volume_height_cm = state.selected_sequence_volume_height_cm ?? sequence.volume_height_cm;
+            sequence.outside_playback = state.selected_sequence_outside_playback || sequence.outside_playback || "black";
+            sequence.frame_count = state.selected_sequence_frame_count || sequence.frame_count;
+        }
+
+        function movementDirectionForState(state, positionPct = null) {
+            if (!state || !state.is_moving || state.is_paused) {
+                return 0;
+            }
+            if (state.switch_direction !== 0) {
+                return state.switch_direction > 0 ? 1 : -1;
+            }
+
+            const currentPct = Number(positionPct ?? state.position_pct ?? 0);
+            const activeTarget = Number(state.active_target_pct);
+            if (Number.isFinite(activeTarget) && Math.abs(activeTarget - currentPct) > 0.05) {
+                return activeTarget > currentPct ? 1 : -1;
+            }
+
+            const target = Number(state.target_pct);
+            if (Number.isFinite(target) && Math.abs(target - currentPct) > 0.05) {
+                return target > currentPct ? 1 : -1;
+            }
+
+            return 0;
+        }
+
+        function estimatedPositionPct() {
+            if (!currentState) {
+                return 0;
+            }
+
+            const basePct = clamp(Number(currentState.position_pct || 0), 0, 100);
+            const direction = movementDirectionForState(currentState, basePct);
+            if (direction === 0) {
+                return basePct;
+            }
+
+            const strokeSec = direction > 0
+                ? Number(currentState.extend_sec || DEFAULT_EXTEND_SEC)
+                : Number(currentState.retract_sec || DEFAULT_RETRACT_SEC);
+            const duty = clamp(Number(currentState.speed_duty || 1), 0.1, 1);
+            const elapsedSec = Math.max(0, (performance.now() - lastStateReceivedAtMs) / 1000);
+            const estimated = basePct + ((100 / Math.max(0.01, strokeSec)) * duty * direction * elapsedSec);
+            const activeTarget = Number(currentState.active_target_pct);
+
+            if (Number.isFinite(activeTarget)) {
+                return direction > 0
+                    ? clamp(estimated, basePct, activeTarget)
+                    : clamp(estimated, activeTarget, basePct);
+            }
+
+            return clamp(estimated, 0, 100);
+        }
+
+        function shouldAnimateDisplay() {
+            return Boolean(currentState && currentState.is_moving && !currentState.is_paused);
+        }
+
+        function renderAnimationFrame() {
+            renderLoopId = null;
+            drawCurrentFrame();
+            if (shouldAnimateDisplay()) {
+                renderLoopId = requestAnimationFrame(renderAnimationFrame);
+            }
+        }
+
+        function scheduleRender() {
+            if (renderLoopId == null) {
+                renderLoopId = requestAnimationFrame(renderAnimationFrame);
+            }
         }
 
         async function apiGet(url) {
@@ -337,13 +579,14 @@
                 hiddenVideo.removeAttribute("src");
                 delete hiddenVideo.dataset.src;
                 hiddenVideo.load();
-                drawCurrentFrame();
+                scheduleRender();
                 return;
             }
 
             clearImageCache();
             currentSequence = await apiGet(`/api/sequence?id=${encodeURIComponent(sequenceId)}`);
             currentSequenceId = sequenceId;
+            syncSequenceMetadataFromState(currentSequence, currentState);
 
             if (currentSequence.kind === "video" && hiddenVideo.dataset.src !== currentSequence.media_url) {
                 hiddenVideo.pause();
@@ -352,10 +595,10 @@
                 hiddenVideo.load();
             }
 
-            drawCurrentFrame();
+            scheduleRender();
         }
 
-        function updateOverlays() {
+        function updateOverlays(displayPositionPct = null) {
             if (!currentState) {
                 sequenceName.textContent = "Waiting";
                 modeLabel.textContent = "Idle";
@@ -367,7 +610,8 @@
 
             sequenceName.textContent = currentState.selected_sequence_name || "Waiting";
             modeLabel.textContent = describeMode(currentState);
-            positionLabel.textContent = `${currentState.position_pct.toFixed(1)}%`;
+            const positionPct = displayPositionPct == null ? currentState.position_pct : displayPositionPct;
+            positionLabel.textContent = `${positionPct.toFixed(1)}%`;
 
             if (showCountdown && currentState.countdown_remaining > 0) {
                 countdown.style.display = "grid";
@@ -378,7 +622,8 @@
         }
 
         function drawCurrentFrame() {
-            updateOverlays();
+            const displayPositionPct = estimatedPositionPct();
+            updateOverlays(displayPositionPct);
 
             if (!currentState || !currentSequence) {
                 clearCanvas();
@@ -386,10 +631,18 @@
             }
 
             if (currentSequence.kind === "images") {
-                const index = frameIndexForPosition(currentSequence.frame_count, currentState.position_pct);
+                const direction = movementDirectionForState(currentState, displayPositionPct);
+                const frame = frameIndexForSequencePosition(currentSequence, displayPositionPct, direction || 1);
+                if (frame == null) {
+                    frameLabel.textContent = "Outside sequence";
+                    clearCanvas();
+                    return;
+                }
+                const index = frame.index;
                 const imageUrl = currentSequence.frame_urls[index];
-                frameLabel.textContent = `Frame ${index + 1} / ${currentSequence.frame_count}`;
-                preloadNearbyFrames(index);
+                const strideLabel = frame.stride > 1 ? ` | every ${frame.stride}` : "";
+                frameLabel.textContent = `Frame ${index + 1} / ${currentSequence.frame_count}${strideLabel}`;
+                preloadNearbyFrames(index, direction, frame.stride);
 
                 const cachedEntry = getImageCacheEntry(imageUrl);
                 if (cachedEntry && cachedEntry.loaded && cachedEntry.image.naturalWidth) {
@@ -399,8 +652,21 @@
                     return;
                 }
 
+                const fallback = nearestLoadedFrame(index, direction, frame.stride);
+                if (fallback) {
+                    frameLabel.textContent = `Frame ${fallback.index + 1} / ${currentSequence.frame_count}${strideLabel}`;
+                    activeImage = fallback.image;
+                    lastDrawnImageUrl = fallback.url;
+                    drawAsset(fallback.image, fallback.image.naturalWidth, fallback.image.naturalHeight, fallback.url);
+                }
+
                 requestImage(imageUrl, (image) => {
-                    if (currentSequence && imageUrl === currentSequence.frame_urls[frameIndexForPosition(currentSequence.frame_count, currentState.position_pct)]) {
+                    if (!currentState || !currentSequence) {
+                        return;
+                    }
+                    const latestDirection = movementDirectionForState(currentState, estimatedPositionPct());
+                    const latestFrame = frameIndexForSequencePosition(currentSequence, estimatedPositionPct(), latestDirection || 1);
+                    if (latestFrame != null && imageUrl === currentSequence.frame_urls[latestFrame.index]) {
                         activeImage = image;
                         lastDrawnImageUrl = imageUrl;
                         drawAsset(image, image.naturalWidth, image.naturalHeight, imageUrl);
@@ -409,12 +675,19 @@
                 return;
             }
 
+            const videoRatio = playbackRatioForPosition(currentSequence, displayPositionPct);
+            if (videoRatio == null) {
+                frameLabel.textContent = "Outside clip";
+                clearCanvas();
+                return;
+            }
+
             frameLabel.textContent = Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0
-                ? `${Math.round(currentState.position_pct)}% through clip`
+                ? `${Math.round(videoRatio * 100)}% through clip`
                 : "Loading clip...";
 
             if (Number.isFinite(hiddenVideo.duration) && hiddenVideo.duration > 0) {
-                const targetTime = (currentState.position_pct / 100) * hiddenVideo.duration;
+                const targetTime = videoRatio * hiddenVideo.duration;
                 if (Math.abs(hiddenVideo.currentTime - targetTime) > 0.033) {
                     try {
                         hiddenVideo.currentTime = targetTime;
@@ -430,10 +703,13 @@
 
         async function applyState(state) {
             currentState = state;
+            lastStateReceivedAtMs = performance.now();
             if ((state.selected_sequence_id || null) !== currentSequenceId) {
                 await loadSequence(state.selected_sequence_id);
+            } else {
+                syncSequenceMetadataFromState(currentSequence, state);
             }
-            drawCurrentFrame();
+            scheduleRender();
         }
 
         async function refreshStateLoop() {
@@ -464,6 +740,13 @@
 
         hiddenVideo.addEventListener("loadedmetadata", drawCurrentFrame);
         hiddenVideo.addEventListener("seeked", () => {
+            if (!currentState || !currentSequence || currentSequence.kind !== "video") {
+                return;
+            }
+            if (playbackRatioForPosition(currentSequence, estimatedPositionPct()) == null) {
+                clearCanvas();
+                return;
+            }
             drawAsset(hiddenVideo, hiddenVideo.videoWidth, hiddenVideo.videoHeight);
         });
         hiddenVideo.addEventListener("loadeddata", drawCurrentFrame);

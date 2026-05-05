@@ -1,7 +1,7 @@
 {
-  "name": "Time Volume Controller",
+  "name": "Volumetric Time Controller",
   "short_name": "Time Volume",
-  "description": "Controller for Time Volume Lift",
+  "description": "Controller for Volumetric Time",
   "start_url": "/controller",
   "display": "standalone",
   "background_color": "#000000",

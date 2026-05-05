@@ -49,6 +49,8 @@ PWM_HZ = 200
 EXTEND_SEC = 23.75
 RETRACT_SEC = 22.0
 HOME_TIMEOUT_SEC = 25.0
+LIFT_STROKE_CM = 48.0
+MIN_SEQUENCE_HEIGHT_CM = 0.01
 
 SW_EXTEND_IN = 6
 SW_RETRACT_IN = 5
@@ -71,10 +73,20 @@ DEFAULT_PORT = int(os.environ.get("ACTUATOR_PORT", "8000"))
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+SEQUENCE_METADATA_FILENAME = "sequence.json"
+OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def coerce_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if math.isfinite(parsed) else fallback
 
 
 def media_url_for(relative_path: str) -> str:
@@ -102,11 +114,32 @@ class SequenceItem:
     frame_count: int = 0
     frame_paths: list[str] = field(default_factory=list)
     media_url: str | None = None
+    start_cm: float = 0.0
+    volume_height_cm: float = LIFT_STROKE_CM
+    outside_playback: str = "black"
 
-    def frame_index_for_pct(self, position_pct: float) -> int:
+    @property
+    def end_cm(self) -> float:
+        return min(LIFT_STROKE_CM, self.start_cm + self.volume_height_cm)
+
+    def playback_ratio_for_pct(self, position_pct: float) -> float | None:
+        position_cm = (clamp(position_pct, 0.0, 100.0) / 100.0) * LIFT_STROKE_CM
+        end_cm = self.end_cm
+
+        if position_cm < self.start_cm:
+            return 0.0 if self.outside_playback == "hold" else None
+        if position_cm > end_cm:
+            return 1.0 if self.outside_playback == "hold" else None
+
+        span_cm = max(MIN_SEQUENCE_HEIGHT_CM, end_cm - self.start_cm)
+        return clamp((position_cm - self.start_cm) / span_cm, 0.0, 1.0)
+
+    def frame_index_for_pct(self, position_pct: float) -> int | None:
+        ratio = self.playback_ratio_for_pct(position_pct)
+        if ratio is None:
+            return None
         if self.kind != "images" or self.frame_count <= 1:
             return 0
-        ratio = clamp(position_pct, 0.0, 100.0) / 100.0
         return min(self.frame_count - 1, int(round(ratio * (self.frame_count - 1))))
 
     def summary(self) -> dict[str, Any]:
@@ -117,6 +150,11 @@ class SequenceItem:
             "relative_path": self.relative_path,
             "frame_count": self.frame_count,
             "media_url": self.media_url,
+            "lift_stroke_cm": LIFT_STROKE_CM,
+            "start_cm": round(self.start_cm, 3),
+            "end_cm": round(self.end_cm, 3),
+            "volume_height_cm": round(self.volume_height_cm, 3),
+            "outside_playback": self.outside_playback,
         }
 
     def detail(self) -> dict[str, Any]:
@@ -133,6 +171,51 @@ class SequenceLibrary:
         self._items: dict[str, SequenceItem] = {}
         self._order: list[str] = []
         self.scan()
+
+    def _read_metadata(self, path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Warning: could not read sequence metadata {path}: {exc}")
+            return {}
+        if not isinstance(payload, dict):
+            print(f"Warning: sequence metadata {path} must be a JSON object.")
+            return {}
+        return payload
+
+    def _metadata_for_directory(self, directory: Path) -> dict[str, Any]:
+        return self._read_metadata(directory / SEQUENCE_METADATA_FILENAME)
+
+    def _metadata_for_video(self, file_path: Path) -> dict[str, Any]:
+        return self._read_metadata(file_path.with_suffix(".json"))
+
+    def _sequence_span(self, metadata: dict[str, Any]) -> tuple[float, float, str]:
+        height_value = metadata.get(
+            "volume_height_cm",
+            metadata.get("height_cm", metadata.get("length_cm", LIFT_STROKE_CM)),
+        )
+        start_value = metadata.get("start_cm", metadata.get("offset_cm", 0.0))
+
+        height_cm = clamp(
+            coerce_float(height_value, LIFT_STROKE_CM),
+            MIN_SEQUENCE_HEIGHT_CM,
+            LIFT_STROKE_CM,
+        )
+        start_cm = clamp(
+            coerce_float(start_value, 0.0),
+            0.0,
+            max(0.0, LIFT_STROKE_CM - MIN_SEQUENCE_HEIGHT_CM),
+        )
+        if start_cm + height_cm > LIFT_STROKE_CM:
+            height_cm = max(MIN_SEQUENCE_HEIGHT_CM, LIFT_STROKE_CM - start_cm)
+
+        outside_playback = str(metadata.get("outside_playback", "black")).strip().lower()
+        if outside_playback not in OUTSIDE_PLAYBACK_MODES:
+            outside_playback = "black"
+
+        return start_cm, height_cm, outside_playback
 
     def scan(self) -> list[dict[str, Any]]:
         root_resolved = self.root.resolve()
@@ -151,12 +234,18 @@ class SequenceLibrary:
                 rel_path = file_path.relative_to(self.root).as_posix()
 
                 if suffix in VIDEO_EXTENSIONS:
+                    start_cm, height_cm, outside_playback = self._sequence_span(
+                        self._metadata_for_video(file_path)
+                    )
                     items[rel_path] = SequenceItem(
                         id=rel_path,
                         name=file_path.stem,
                         kind="video",
                         relative_path=rel_path,
                         media_url=media_url_for(rel_path),
+                        start_cm=start_cm,
+                        volume_height_cm=height_cm,
+                        outside_playback=outside_playback,
                     )
                 elif suffix in IMAGE_EXTENSIONS:
                     image_paths.append(rel_path)
@@ -166,6 +255,9 @@ class SequenceLibrary:
 
             sequence_id = rel_dir or "__root__"
             display_name = directory.name if rel_dir else "media"
+            start_cm, height_cm, outside_playback = self._sequence_span(
+                self._metadata_for_directory(directory)
+            )
             items[sequence_id] = SequenceItem(
                 id=sequence_id,
                 name=display_name,
@@ -173,6 +265,9 @@ class SequenceLibrary:
                 relative_path=rel_dir or ".",
                 frame_count=len(image_paths),
                 frame_paths=image_paths,
+                start_cm=start_cm,
+                volume_height_cm=height_cm,
+                outside_playback=outside_playback,
             )
 
         order = sorted(
@@ -620,6 +715,13 @@ class InstallationController:
             "selected_sequence_kind": sequence.kind if sequence else None,
             "selected_sequence_frame_count": sequence.frame_count if sequence else 0,
             "selected_sequence_media_url": sequence.media_url if sequence else None,
+            "selected_sequence_start_cm": round(sequence.start_cm, 3) if sequence else 0.0,
+            "selected_sequence_end_cm": round(sequence.end_cm, 3) if sequence else LIFT_STROKE_CM,
+            "selected_sequence_volume_height_cm": round(sequence.volume_height_cm, 3) if sequence else LIFT_STROKE_CM,
+            "selected_sequence_outside_playback": sequence.outside_playback if sequence else "black",
+            "lift_stroke_cm": LIFT_STROKE_CM,
+            "extend_sec": EXTEND_SEC,
+            "retract_sec": RETRACT_SEC,
             "frame_index": sequence.frame_index_for_pct(position_pct) if sequence else 0,
             "is_simulation": self.hardware.req is None,
             "media_root": str(MEDIA_ROOT),

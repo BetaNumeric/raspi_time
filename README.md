@@ -11,6 +11,23 @@ The active runtime is the web stack:
 - `media/` contains image sequences and video clips used by the display.
 - `start_time_volume.sh`, `stop_time_volume.sh`, `install_pi_launchers.sh`, and `install_boot_service.sh` are Raspberry Pi launch helpers.
 
+## Sequence Height Metadata
+
+Image-sequence folders can opt into a shorter physical playback span by adding
+`sequence.json` next to the frames:
+
+```json
+{
+  "volume_height_cm": 32,
+  "start_cm": 0
+}
+```
+
+The lift stroke is calibrated as 48 cm. Without `sequence.json`, a sequence
+plays over the full 0-48 cm stroke. With the example above, the sequence plays
+from 0-32 cm and the display is black outside that span. For videos, use a JSON
+sidecar with the same base name as the clip, such as `clip.json` for `clip.mp4`.
+
 ## Run
 
 ```bash

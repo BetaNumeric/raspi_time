@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Time Volume Lift Control</title>
+    <title>Volumetric Time Lift Control v1.9</title>
     
     <!-- PWA Settings -->
     <link rel="manifest" href="/manifest.json">
@@ -532,6 +532,39 @@
             margin-top: 10px;
         }
 
+        .sequence-readout {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .sequence-readout-item {
+            min-width: 0;
+        }
+
+        .sequence-readout-label {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 10px;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .sequence-readout-value {
+            display: block;
+            font-weight: 800;
+            line-height: 1.2;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         .sequence-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -852,9 +885,9 @@
                     <div class="field">
                         <label class="range-label" for="piCameraDurationRange">
                             <span>Duration</span>
-                            <span id="piCameraDurationValue" class="range-value">30s</span>
+                            <span id="piCameraDurationValue" class="range-value">25s</span>
                         </label>
-                        <input id="piCameraDurationRange" type="range" min="1" max="600" step="1" value="30">
+                        <input id="piCameraDurationRange" type="range" min="1" max="30" step="1" value="25">
                     </div>
                     <div class="field">
                         <label class="range-label" for="piCameraFrameGapRange">
@@ -936,6 +969,32 @@
                     </svg>
                     <span class="sr-only">Next sequence</span>
                 </button>
+            </div>
+            <div class="sequence-readout" aria-live="polite">
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Height</span>
+                    <span id="sequenceHeightValue" class="sequence-readout-value">-</span>
+                </div>
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Span</span>
+                    <span id="sequenceSpanValue" class="sequence-readout-value">-</span>
+                </div>
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Lift</span>
+                    <span id="sequenceLiftValue" class="sequence-readout-value">-</span>
+                </div>
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Playback</span>
+                    <span id="sequencePlaybackValue" class="sequence-readout-value">-</span>
+                </div>
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Rate</span>
+                    <span id="sequenceRateValue" class="sequence-readout-value">-</span>
+                </div>
+                <div class="sequence-readout-item">
+                    <span class="sequence-readout-label">Frames</span>
+                    <span id="sequenceStrideValue" class="sequence-readout-value">-</span>
+                </div>
             </div>
             <div class="sequence-grid">
                 
@@ -1050,6 +1109,12 @@
         const pauseExtendInput = $("#pauseExtendInput");
         const pauseRetractInput = $("#pauseRetractInput");
         const sequenceSelect = $("#sequenceSelect");
+        const sequenceHeightValue = $("#sequenceHeightValue");
+        const sequenceSpanValue = $("#sequenceSpanValue");
+        const sequenceLiftValue = $("#sequenceLiftValue");
+        const sequencePlaybackValue = $("#sequencePlaybackValue");
+        const sequenceRateValue = $("#sequenceRateValue");
+        const sequenceStrideValue = $("#sequenceStrideValue");
         const mediaRootNote = $("#mediaRootNote");
         const previewImage = $("#previewImage");
         const previewVideo = $("#previewVideo");
@@ -1096,11 +1161,107 @@
         let targetDebounce = null;
         let speedDebounce = null;
         let piCameraPreviewTimer = null;
+        let piCameraPreviewLoading = false;
         let piCameraLimitsApplied = false;
         let piCameraLimits = null;
 
+        const DEFAULT_LIFT_STROKE_CM = 48;
+        const MIN_SEQUENCE_HEIGHT_CM = 0.01;
+        const DEFAULT_EXTEND_SEC = 23.75;
+        const DEFAULT_RETRACT_SEC = 22.0;
+        const MAX_SEQUENCE_PLAYBACK_FPS = 30;
         const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
-        const frameIndexForPosition = (frameCount, pct) => !frameCount || frameCount <= 1 ? 0 : Math.min(frameCount - 1, Math.round((clamp(pct, 0, 100) / 100) * (frameCount - 1)));
+
+        function sequenceSpan(sequence) {
+            const strokeCm = Math.max(
+                MIN_SEQUENCE_HEIGHT_CM,
+                Number(sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM)
+            );
+            const startCm = clamp(Number(sequence.start_cm || 0), 0, strokeCm - MIN_SEQUENCE_HEIGHT_CM);
+            const configuredEndCm = Number(sequence.end_cm);
+            const fallbackHeightCm = Number(sequence.volume_height_cm || strokeCm);
+            const endCm = Number.isFinite(configuredEndCm)
+                ? clamp(configuredEndCm, startCm + MIN_SEQUENCE_HEIGHT_CM, strokeCm)
+                : clamp(startCm + fallbackHeightCm, startCm + MIN_SEQUENCE_HEIGHT_CM, strokeCm);
+            return { strokeCm, startCm, endCm, heightCm: endCm - startCm };
+        }
+
+        function playbackRatioForPosition(sequence, pct) {
+            const { strokeCm, startCm, endCm } = sequenceSpan(sequence);
+            const positionCm = (clamp(Number(pct || 0), 0, 100) / 100) * strokeCm;
+
+            if (positionCm < startCm) {
+                return sequence.outside_playback === "hold" ? 0 : null;
+            }
+            if (positionCm > endCm) {
+                return sequence.outside_playback === "hold" ? 1 : null;
+            }
+            return clamp((positionCm - startCm) / (endCm - startCm), 0, 1);
+        }
+
+        function playbackDirectionForState(state) {
+            if (!state) return 1;
+            if (state.switch_direction !== 0) return state.switch_direction > 0 ? 1 : -1;
+            const positionPct = Number(state.position_pct || 0);
+            const activeTarget = Number(state.active_target_pct);
+            if (Number.isFinite(activeTarget) && Math.abs(activeTarget - positionPct) > 0.05) {
+                return activeTarget > positionPct ? 1 : -1;
+            }
+            const targetPct = Number(state.target_pct);
+            if (Number.isFinite(targetPct) && Math.abs(targetPct - positionPct) > 0.05) {
+                return targetPct > positionPct ? 1 : -1;
+            }
+            return 1;
+        }
+
+        function frameRateLimitForSequence(sequence, direction = 1, state = currentState) {
+            if (!sequence || !sequence.frame_count || sequence.frame_count <= 1) {
+                return { requestedFps: 0, effectiveFps: 0, stride: 1, durationSec: 0 };
+            }
+
+            const { strokeCm, heightCm } = sequenceSpan(sequence);
+            const travelDirection = direction < 0 ? -1 : 1;
+            const strokeSec = travelDirection > 0
+                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC)
+                : Number(state?.retract_sec || DEFAULT_RETRACT_SEC);
+            const duty = clamp(Number(state?.speed_duty || 1), 0.1, 1);
+            const durationSec = ((heightCm / strokeCm) * Math.max(0.01, strokeSec)) / duty;
+            const requestedFps = (Number(sequence.frame_count) - 1) / Math.max(0.01, durationSec);
+            const stride = Math.max(1, Math.ceil(requestedFps / MAX_SEQUENCE_PLAYBACK_FPS));
+            return {
+                requestedFps,
+                effectiveFps: requestedFps / stride,
+                stride,
+                durationSec
+            };
+        }
+
+        function quantizeFrameIndex(index, frameCount, stride) {
+            if (stride <= 1 || frameCount <= 1) return index;
+            const lastIndex = frameCount - 1;
+            if (index <= 0) return 0;
+            if (index >= lastIndex) return lastIndex;
+            return clamp(Math.round(index / stride) * stride, 0, lastIndex);
+        }
+
+        function frameIndexForSequencePosition(sequence, pct, direction = 1) {
+            if (!sequence) return { index: 0, rawIndex: 0, stride: 1 };
+            const ratio = playbackRatioForPosition(sequence, pct);
+            if (ratio == null) return null;
+            if (!sequence.frame_count || sequence.frame_count <= 1) {
+                return { index: 0, rawIndex: 0, stride: 1 };
+            }
+            const frameCount = Number(sequence.frame_count);
+            const rawIndex = Math.min(frameCount - 1, Math.round(ratio * (frameCount - 1)));
+            const limit = frameRateLimitForSequence(sequence, direction, currentState);
+            return {
+                index: quantizeFrameIndex(rawIndex, frameCount, limit.stride),
+                rawIndex,
+                stride: limit.stride,
+                requestedFps: limit.requestedFps,
+                effectiveFps: limit.effectiveFps
+            };
+        }
         const fallbackPiCameraLimits = {
             default_capture_mode: "1296x972",
             capture_modes: [
@@ -1115,7 +1276,7 @@
                 { value: "mean", label: "Mean" },
                 { value: "screen", label: "Screen" }
             ],
-            duration_sec: { min: 1, max: 600, step: 1, default: 30 },
+            duration_sec: { min: 1, max: 30, step: 1, default: 25 },
             frame_gap_sec: { min: 0, max: 4, step: 0.01, default: 0 },
             shutter_sec: { min: 0.01, max: 4.8, step: 0.01, default: 1 },
             iso: { min: 100, max: 6350, step: 50, default: 100 },
@@ -1223,10 +1384,11 @@
                 clearTimeout(piCameraPreviewTimer);
                 piCameraPreviewTimer = null;
             }
+            piCameraPreviewLoading = false;
         }
 
         function schedulePiCameraPreview(delayMs = 0) {
-            if (piCameraPreviewTimer) return;
+            if (piCameraPreviewTimer || piCameraPreviewLoading) return;
             piCameraPreviewTimer = setTimeout(() => {
                 piCameraPreviewTimer = null;
                 refreshPiCameraPreview();
@@ -1245,6 +1407,7 @@
                 stopPiCameraPreview();
                 return;
             }
+            if (piCameraPreviewLoading) return;
             const previewUsesManual = piCameraPreviewManual.checked && piCameraManualExposure.checked;
             const params = new URLSearchParams({
                 t: String(Date.now()),
@@ -1254,6 +1417,7 @@
                 params.set("shutter_sec", String(Number(piCameraShutterRange.value)));
                 params.set("iso", String(Math.round(Number(piCameraIsoRange.value))));
             }
+            piCameraPreviewLoading = true;
             piCameraPreview.src = `/pi-camera/preview.jpg?${params.toString()}`;
         }
 
@@ -1316,7 +1480,7 @@
                 setPiCameraPreviewMode("empty");
                 piCameraPreviewEmpty.textContent = "Recording...";
             } else {
-                piCameraPreviewEmpty.textContent = "Preview unavailable.";
+                if (!piCameraPreviewLoading) piCameraPreviewEmpty.textContent = "Preview unavailable.";
                 if (piCameraDetails.open) {
                     schedulePiCameraPreview(0);
                 } else {
@@ -1335,6 +1499,18 @@
             if (state.is_moving && state.is_paused) return "Paused";
             if (state.is_moving) return "Moving";
             return "Idle";
+        }
+
+        function syncSequenceMetadataFromState(sequence, state) {
+            if (!sequence || !state || sequence.id !== state.selected_sequence_id) {
+                return;
+            }
+            sequence.lift_stroke_cm = state.lift_stroke_cm || sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM;
+            sequence.start_cm = state.selected_sequence_start_cm ?? sequence.start_cm ?? 0;
+            sequence.end_cm = state.selected_sequence_end_cm ?? sequence.end_cm;
+            sequence.volume_height_cm = state.selected_sequence_volume_height_cm ?? sequence.volume_height_cm;
+            sequence.outside_playback = state.selected_sequence_outside_playback || sequence.outside_playback || "black";
+            sequence.frame_count = state.selected_sequence_frame_count || sequence.frame_count;
         }
 
         async function apiGet(url) {
@@ -1389,6 +1565,79 @@
 
         function updateSpeedLabel(value) {
             speedValue.textContent = `${Math.round(Number(value) * 100)}%`;
+        }
+
+        function formatCm(value) {
+            return `${Number(value || 0).toFixed(1).replace(/\.0$/, "")} cm`;
+        }
+
+        function formatSequenceSpan(sequence) {
+            const strokeCm = Number(sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM);
+            const heightCm = Number(sequence.volume_height_cm || strokeCm);
+            const startCm = Number(sequence.start_cm || 0);
+            const endCm = Number(sequence.end_cm || (startCm + heightCm));
+            if (Math.abs(heightCm - strokeCm) < 0.01 && Math.abs(startCm) < 0.01) {
+                return formatCm(strokeCm);
+            }
+            return `${formatCm(heightCm)} (${formatCm(startCm)}-${formatCm(endCm)})`;
+        }
+
+        function sequenceForState(state) {
+            if (!state || !state.selected_sequence_id) return null;
+            if (currentSequence && currentSequence.id === state.selected_sequence_id) {
+                return currentSequence;
+            }
+            const libraryItem = libraryItems.find((item) => item.id === state.selected_sequence_id);
+            if (libraryItem) return libraryItem;
+            return {
+                id: state.selected_sequence_id,
+                name: state.selected_sequence_name,
+                kind: state.selected_sequence_kind,
+                frame_count: state.selected_sequence_frame_count,
+                media_url: state.selected_sequence_media_url,
+                lift_stroke_cm: state.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM,
+                start_cm: state.selected_sequence_start_cm || 0,
+                end_cm: state.selected_sequence_end_cm || DEFAULT_LIFT_STROKE_CM,
+                volume_height_cm: state.selected_sequence_volume_height_cm || DEFAULT_LIFT_STROKE_CM,
+                outside_playback: state.selected_sequence_outside_playback || "black"
+            };
+        }
+
+        function renderSequenceReadout(state) {
+            const sequence = sequenceForState(state);
+            if (!sequence) {
+                sequenceHeightValue.textContent = "-";
+                sequenceSpanValue.textContent = "-";
+                sequenceLiftValue.textContent = "-";
+                sequencePlaybackValue.textContent = "-";
+                sequenceRateValue.textContent = "-";
+                sequenceStrideValue.textContent = "-";
+                return;
+            }
+
+            const strokeCm = Math.max(
+                MIN_SEQUENCE_HEIGHT_CM,
+                Number(sequence.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM)
+            );
+            const startCm = clamp(Number(sequence.start_cm || 0), 0, strokeCm - MIN_SEQUENCE_HEIGHT_CM);
+            const heightCm = Number(sequence.volume_height_cm || strokeCm);
+            const endCm = Number(sequence.end_cm || (startCm + heightCm));
+            const positionCm = (clamp(Number(state.position_pct || 0), 0, 100) / 100) * strokeCm;
+            const ratio = playbackRatioForPosition(sequence, state.position_pct);
+            const frameLimit = frameRateLimitForSequence(sequence, playbackDirectionForState(state), state);
+            const requestedFps = Math.round(frameLimit.requestedFps);
+            const effectiveFps = frameLimit.effectiveFps >= 10
+                ? Math.round(frameLimit.effectiveFps)
+                : Number(frameLimit.effectiveFps.toFixed(1));
+
+            sequenceHeightValue.textContent = formatCm(heightCm);
+            sequenceSpanValue.textContent = `${formatCm(startCm)}-${formatCm(endCm)}`;
+            sequenceLiftValue.textContent = formatCm(positionCm);
+            sequencePlaybackValue.textContent = ratio == null ? "Outside" : `${Math.round(ratio * 100)}%`;
+            sequenceRateValue.textContent = frameLimit.stride > 1
+                ? `${requestedFps} -> ${effectiveFps} fps`
+                : `${requestedFps} fps`;
+            sequenceStrideValue.textContent = frameLimit.stride > 1 ? `Step ${frameLimit.stride}` : "All";
         }
 
         function setPlayButtonState(state) {
@@ -1620,6 +1869,7 @@
             if (state.camera_url) {
                 cameraLink.href = state.camera_url;
             }
+            renderSequenceReadout(state);
             renderPiCamera(state);
             if (targetRange.disabled !== state.is_cycling) {
                 targetRange.disabled = state.is_cycling;
@@ -1647,7 +1897,8 @@
         function populateLibrary(selectedId) {
             const options = ['<option value="">No sequence</option>'];
             for (const item of libraryItems) {
-                const suffix = item.kind === "images" ? ` (${item.frame_count} frames)` : " (video)";
+                const baseSuffix = item.kind === "images" ? `${item.frame_count} frames` : "video";
+                const suffix = ` (${baseSuffix}, ${formatSequenceSpan(item)})`;
                 const selected = item.id === selectedId ? " selected" : "";
                 options.push(`<option value="${item.id}"${selected}>${item.name}${suffix}</option>`);
             }
@@ -1665,22 +1916,26 @@
             if (!sequenceId) {
                 currentSequence = null;
                 currentSequenceId = null;
+                if (currentState) renderSequenceReadout(currentState);
                 renderPreview();
                 return;
             }
             currentSequence = await apiGet(`/api/sequence?id=${encodeURIComponent(sequenceId)}`);
             currentSequenceId = sequenceId;
+            syncSequenceMetadataFromState(currentSequence, currentState);
             if (currentSequence.kind === "video" && previewVideo.dataset.src !== currentSequence.media_url) {
                 previewVideo.pause();
                 previewVideo.dataset.src = currentSequence.media_url;
                 previewVideo.src = currentSequence.media_url;
                 previewVideo.load();
             }
+            if (currentState) renderSequenceReadout(currentState);
             renderPreview();
         }
 
         function renderPreview() {
             if (!currentState || !currentSequence) {
+                previewEmpty.textContent = "Select a sequence.";
                 setPreviewMode("empty");
                 previewMeta.textContent = "No sequence";
                 return;
@@ -1689,13 +1944,25 @@
             const sequenceName = currentState.selected_sequence_name || currentSequence.name || "Sequence";
 
             if (currentSequence.kind === "images") {
-                const index = frameIndexForPosition(currentSequence.frame_count, currentState.position_pct);
+                const frame = frameIndexForSequencePosition(
+                    currentSequence,
+                    currentState.position_pct,
+                    playbackDirectionForState(currentState)
+                );
+                if (frame == null) {
+                    previewEmpty.textContent = "Outside playback span.";
+                    previewMeta.textContent = `${sequenceName} | ${formatSequenceSpan(currentSequence)}`;
+                    setPreviewMode("empty");
+                    return;
+                }
+                const index = frame.index;
                 const url = currentSequence.frame_urls[index];
                 if (previewImage.dataset.src !== url) {
                     previewImage.dataset.src = url;
                     previewImage.src = url;
                 }
-                previewMeta.textContent = `${sequenceName}  |  Frame ${index + 1} of ${currentSequence.frame_count}`;
+                const strideLabel = frame.stride > 1 ? ` | every ${frame.stride}` : "";
+                previewMeta.textContent = `${sequenceName} | Frame ${index + 1} of ${currentSequence.frame_count}${strideLabel} | ${formatSequenceSpan(currentSequence)}`;
                 setPreviewMode("image");
                 return;
             }
@@ -1706,12 +1973,19 @@
                 previewVideo.src = currentSequence.media_url;
                 previewVideo.load();
             }
+            const videoRatio = playbackRatioForPosition(currentSequence, currentState.position_pct);
+            if (videoRatio == null) {
+                previewEmpty.textContent = "Outside playback span.";
+                previewMeta.textContent = `${sequenceName} | ${formatSequenceSpan(currentSequence)}`;
+                setPreviewMode("empty");
+                return;
+            }
             if (Number.isFinite(previewVideo.duration) && previewVideo.duration > 0) {
-                const targetTime = (currentState.position_pct / 100) * previewVideo.duration;
+                const targetTime = videoRatio * previewVideo.duration;
                 if (Math.abs(previewVideo.currentTime - targetTime) > 0.08) {
                     try { previewVideo.currentTime = targetTime; } catch (error) {}
                 }
-                previewMeta.textContent = `${sequenceName} • ${Math.round(currentState.position_pct)}%`;
+                previewMeta.textContent = `${sequenceName} | ${Math.round(videoRatio * 100)}% | ${formatSequenceSpan(currentSequence)}`;
             } else {
                 previewMeta.textContent = `${sequenceName} • Loading...`;
             }
@@ -1725,6 +1999,8 @@
             if ((state.selected_sequence_id || null) !== currentSequenceId) {
                 await loadSequence(state.selected_sequence_id);
             } else {
+                syncSequenceMetadataFromState(currentSequence, state);
+                renderSequenceReadout(state);
                 renderPreview();
             }
         }
@@ -1907,10 +2183,12 @@
             if (currentState) renderPiCamera(currentState);
         });
         piCameraPreview.addEventListener("load", () => {
+            piCameraPreviewLoading = false;
             setPiCameraPreviewMode("image");
             schedulePiCameraPreview(5000);
         });
         piCameraPreview.addEventListener("error", () => {
+            piCameraPreviewLoading = false;
             setPiCameraPreviewMode("empty");
             schedulePiCameraPreview(7000);
         });

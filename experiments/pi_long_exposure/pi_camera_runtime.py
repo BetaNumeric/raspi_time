@@ -31,7 +31,7 @@ OV5647_CAPTURE_MODES = [
 DEFAULT_CAPTURE_MODE_KEY = "1296x972"
 MAX_FRAME_INTERVAL_SEC = 4.879
 OV5647_LIMITS = {
-    "duration_sec": {"min": 1, "max": 30, "step": 1, "default": 30},
+    "duration_sec": {"min": 1, "max": 30, "step": 1, "default": 25},
     "frame_gap_sec": {"min": 0, "max": 4, "step": 0.01, "default": 0},
     "shutter_sec": {"min": 0.01, "max": 4.8, "step": 0.01, "default": 1.0},
     "iso": {"min": 100, "max": 6350, "step": 50, "default": 100},
@@ -252,7 +252,7 @@ class PiCameraRuntime:
 
     def capture_preview_jpeg(self, settings: RecordSettings | None = None, quality: int = 82) -> bytes:
         self._require_available()
-        if not self.camera_lock.acquire(blocking=False):
+        if not self.camera_lock.acquire(timeout=2.0):
             raise CameraBusyError("Pi camera is busy")
 
         picam2 = None
