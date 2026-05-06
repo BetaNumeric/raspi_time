@@ -9,6 +9,15 @@ HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
 CAMERA_URL="${TIME_VOLUME_CAMERA_URL:-}"
 CAMERA_DIR="${TIME_VOLUME_CAMERA_DIR:-}"
+DISPLAY_BACKEND="${TIME_VOLUME_DISPLAY_BACKEND:-none}"
+
+case "$DISPLAY_BACKEND" in
+    browser|mpv|none) ;;
+    *)
+        echo "Unknown display backend '$DISPLAY_BACKEND'; using none for boot service."
+        DISPLAY_BACKEND="none"
+        ;;
+esac
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -41,7 +50,7 @@ After=local-fs.target
 [Service]
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=$PYTHON_BIN $SCRIPT_DIR/actuator_web.py --host $HOST --port $PORT --require-gpio
+ExecStart=$PYTHON_BIN $SCRIPT_DIR/actuator_web.py --host $HOST --port $PORT --require-gpio --display-backend $DISPLAY_BACKEND
 Restart=always
 RestartSec=2
 User=$RUN_USER

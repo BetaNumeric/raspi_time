@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$SCRIPT_DIR/.run"
 PID_FILE="$RUN_DIR/time_volume_server.pid"
 BROWSER_PID_FILE="$RUN_DIR/time_volume_browser.pid"
+MPV_PID_FILE="$RUN_DIR/time_volume_mpv.pid"
 
 stop_pid_file() {
     local pid_file="$1"
@@ -21,6 +22,7 @@ stop_pid_file() {
 }
 
 stop_pid_file "$BROWSER_PID_FILE"
+stop_pid_file "$MPV_PID_FILE"
 stop_pid_file "$PID_FILE"
 
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet time-volume.service 2>/dev/null; then

@@ -5,10 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$SCRIPT_DIR/.run"
 PID_FILE="$RUN_DIR/time_volume_server.pid"
 BROWSER_PID_FILE="$RUN_DIR/time_volume_browser.pid"
+MPV_PID_FILE="$RUN_DIR/time_volume_mpv.pid"
 LOG_FILE="$RUN_DIR/time_volume_server.log"
 
 HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
+DISPLAY_BACKEND="${TIME_VOLUME_DISPLAY_BACKEND:-mpv}"
 DISPLAY_PATH="${TIME_VOLUME_DISPLAY_PATH:-/display}"
 DEFAULT_CAMERA_URL="https://betanumeric.github.io/volumetric_time_camera/"
 if [[ -n "${TIME_VOLUME_CAMERA_URL+x}" ]]; then
@@ -20,6 +22,28 @@ DISPLAY_URL="http://127.0.0.1:${PORT}${DISPLAY_PATH}"
 HEALTH_URL="http://127.0.0.1:${PORT}/api/state"
 
 mkdir -p "$RUN_DIR"
+
+case "$DISPLAY_BACKEND" in
+    browser|mpv|none) ;;
+    *)
+        echo "Unknown display backend '$DISPLAY_BACKEND'; falling back to browser."
+        DISPLAY_BACKEND="browser"
+        ;;
+esac
+
+stop_pid_file() {
+    local pid_file="$1"
+    if [[ ! -f "$pid_file" ]]; then
+        return 0
+    fi
+
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
 
 find_browser() {
     for browser in chromium-browser chromium epiphany-browser epiphany firefox; do
@@ -46,6 +70,15 @@ PY
 
 start_server() {
     if server_is_healthy; then
+        if [[ "$DISPLAY_BACKEND" == "mpv" && ! -f "$MPV_PID_FILE" && -f "$PID_FILE" ]]; then
+            stop_pid_file "$PID_FILE"
+            sleep 1
+        else
+            return 0
+        fi
+    fi
+
+    if server_is_healthy; then
         return 0
     fi
 
@@ -57,7 +90,7 @@ start_server() {
         fi
     fi
 
-    nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" >>"$LOG_FILE" 2>&1 &
+    nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" --display-backend "$DISPLAY_BACKEND" >>"$LOG_FILE" 2>&1 &
     echo "$!" > "$PID_FILE"
 }
 
@@ -127,12 +160,26 @@ print_urls() {
         fi
     fi
     echo "Display   : $DISPLAY_URL"
+    echo "Backend   : $DISPLAY_BACKEND"
 }
+
+if [[ "$DISPLAY_BACKEND" == "mpv" ]] && ! command -v "${TIME_VOLUME_MPV_BIN:-mpv}" >/dev/null 2>&1; then
+    echo "MPV not found; falling back to browser display."
+    DISPLAY_BACKEND="browser"
+fi
+
+if [[ "$DISPLAY_BACKEND" == "mpv" ]]; then
+    stop_pid_file "$BROWSER_PID_FILE"
+else
+    stop_pid_file "$MPV_PID_FILE"
+fi
 
 start_server
 
 if wait_for_server; then
-    launch_browser
+    if [[ "$DISPLAY_BACKEND" != "mpv" && "$DISPLAY_BACKEND" != "none" ]]; then
+        launch_browser
+    fi
     print_urls
 else
     echo "Server failed to start. Check $LOG_FILE"

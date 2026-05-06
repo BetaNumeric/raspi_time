@@ -8,7 +8,9 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -61,6 +63,7 @@ SW_DEBOUNCE_SAMPLES = 2
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 MEDIA_ROOT = BASE_DIR / "media"
+RUN_DIR = BASE_DIR / ".run"
 CAMERA_APP_DIR = Path(os.environ.get("TIME_VOLUME_CAMERA_DIR", BASE_DIR / "camera_app")).expanduser()
 if not CAMERA_APP_DIR.is_absolute():
     CAMERA_APP_DIR = BASE_DIR / CAMERA_APP_DIR
@@ -75,6 +78,11 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
+MPV_DEFAULT_FPS_CAP = 30.0
+DEFAULT_DISPLAY_BACKEND = "mpv"
+MPV_IPC_PATH = RUN_DIR / "time_volume_mpv.sock"
+MPV_PID_FILE = RUN_DIR / "time_volume_mpv.pid"
+MPV_BLACK_IMAGE = RUN_DIR / "mpv_black.png"
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -87,6 +95,28 @@ def coerce_float(value: Any, fallback: float) -> float:
     except (TypeError, ValueError):
         return fallback
     return parsed if math.isfinite(parsed) else fallback
+
+
+def sequence_span_cm(sequence: "SequenceItem") -> tuple[float, float, float]:
+    start_cm = clamp(sequence.start_cm, 0.0, LIFT_STROKE_CM - MIN_SEQUENCE_HEIGHT_CM)
+    end_cm = clamp(sequence.end_cm, start_cm + MIN_SEQUENCE_HEIGHT_CM, LIFT_STROKE_CM)
+    return start_cm, end_cm, end_cm - start_cm
+
+
+def sequence_travel_duration_sec(sequence: "SequenceItem", direction: int, duty: float) -> float:
+    _, _, height_cm = sequence_span_cm(sequence)
+    stroke_sec = EXTEND_SEC if direction >= 0 else RETRACT_SEC
+    effective_duty = clamp(duty, 0.1, 1.0)
+    return ((height_cm / LIFT_STROKE_CM) * stroke_sec) / effective_duty
+
+
+def frame_stride_for_sequence(sequence: "SequenceItem", direction: int, duty: float, fps_cap: float) -> tuple[int, float, float]:
+    if sequence.kind != "images" or sequence.frame_count <= 1:
+        return 1, 0.0, 0.0
+    duration_sec = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
+    requested_fps = (sequence.frame_count - 1) / duration_sec
+    stride = max(1, math.ceil(requested_fps / max(1.0, fps_cap)))
+    return stride, requested_fps, duration_sec
 
 
 def media_url_for(relative_path: str) -> str:
@@ -540,6 +570,8 @@ class InstallationController:
         self.last_cycle_end_reason: str | None = None
         self.last_runtime_error: str | None = None
         self.settings_save_timer: threading.Timer | None = None
+        self.display_backend_mode = "browser"
+        self.display_backend_status = "HTML display fallback"
 
         self.switch_raw_dir = 0
         self.switch_stable_dir = 0
@@ -648,6 +680,11 @@ class InstallationController:
             return "RETRACT"
         return "OFF"
 
+    def set_display_backend_status(self, mode: str, status: str) -> None:
+        with self.state_lock:
+            self.display_backend_mode = mode
+            self.display_backend_status = status
+
     def get_state(self) -> dict[str, Any]:
         with self.hardware.lock:
             position_pct = round(self.hardware.position_pct, 2)
@@ -671,6 +708,8 @@ class InstallationController:
             cycle_pause_deadline = self.cycle_pause_deadline
             last_cycle_end_reason = self.last_cycle_end_reason
             last_runtime_error = self.last_runtime_error
+            display_backend_mode = self.display_backend_mode
+            display_backend_status = self.display_backend_status
 
         now = time.time()
         countdown_remaining = 0
@@ -727,6 +766,8 @@ class InstallationController:
             "media_root": str(MEDIA_ROOT),
             "controller_url": "/controller",
             "display_url": "/display",
+            "display_backend_mode": display_backend_mode,
+            "display_backend_status": display_backend_status,
             "camera_url": configured_camera_url(),
         }
 
@@ -1680,6 +1721,386 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         print(message, end="")
 
 
+class MpvDisplayBackend:
+    def __init__(
+        self,
+        controller: InstallationController,
+        mpv_bin: str = "mpv",
+        fps_cap: float = MPV_DEFAULT_FPS_CAP,
+    ):
+        self.controller = controller
+        self.mpv_bin = mpv_bin
+        self.fps_cap = max(1.0, float(fps_cap))
+        self.process: subprocess.Popen[Any] | None = None
+        self.sock: socket.socket | None = None
+        self.reader: Any = None
+        self.socket_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.request_id = 0
+        self.loaded_key: tuple[Any, ...] | None = None
+        self.last_pause: bool | None = None
+        self.last_speed: float | None = None
+        self.last_seek_at = 0.0
+        self.duration_cache: dict[tuple[Any, ...], float] = {}
+        self.playlist_dir = RUN_DIR / "mpv_playlists"
+        self.last_direction = 1
+
+    def start(self) -> bool:
+        mpv_path = shutil.which(self.mpv_bin)
+        if not mpv_path:
+            self.controller.set_display_backend_status("browser", f"MPV not found; use /display")
+            print("Warning: MPV display backend requested, but mpv was not found. Use /display fallback.")
+            return False
+
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        self.playlist_dir.mkdir(parents=True, exist_ok=True)
+        self._write_black_image()
+
+        try:
+            if MPV_IPC_PATH.exists():
+                MPV_IPC_PATH.unlink()
+        except Exception:
+            pass
+
+        command = [
+            mpv_path,
+            "--idle=yes",
+            "--force-window=immediate",
+            "--fullscreen",
+            "--no-terminal",
+            "--really-quiet",
+            "--osc=no",
+            "--osd-level=0",
+            "--keep-open=yes",
+            "--loop-file=no",
+            f"--input-ipc-server={MPV_IPC_PATH}",
+        ]
+
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+            MPV_PID_FILE.write_text(str(self.process.pid), encoding="utf-8")
+            self._connect()
+        except Exception as exc:
+            self.controller.set_display_backend_status("browser", f"MPV failed: {exc}")
+            print(f"Warning: MPV display backend failed to start ({exc}). Use /display fallback.")
+            self.stop()
+            return False
+
+        self.controller.set_display_backend_status("mpv", "MPV fullscreen display")
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=1.0)
+        with self.socket_lock:
+            try:
+                if self.sock:
+                    self._send_command_unlocked(["quit"])
+            except Exception:
+                pass
+            try:
+                if self.reader:
+                    self.reader.close()
+            except Exception:
+                pass
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.reader = None
+            self.sock = None
+
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.5)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+        self.process = None
+        try:
+            MPV_PID_FILE.unlink()
+        except Exception:
+            pass
+        try:
+            MPV_IPC_PATH.unlink()
+        except Exception:
+            pass
+
+    def _write_black_image(self) -> None:
+        if MPV_BLACK_IMAGE.exists():
+            return
+        # 1x1 black PNG.
+        MPV_BLACK_IMAGE.write_bytes(
+            bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+                "0000000c4944415408d7636060000000050001a5f645400000000049454e44ae426082"
+            )
+        )
+
+    def _connect(self) -> None:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if self.process and self.process.poll() is not None:
+                raise RuntimeError("mpv exited before IPC became available")
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(str(MPV_IPC_PATH))
+                sock.settimeout(0.25)
+                self.sock = sock
+                self.reader = sock.makefile("r", encoding="utf-8")
+                return
+            except Exception:
+                time.sleep(0.1)
+        raise RuntimeError("timed out waiting for mpv IPC")
+
+    def _send_command_unlocked(self, command: list[Any], timeout: float = 0.25) -> dict[str, Any] | None:
+        if not self.sock:
+            self._connect()
+        self.request_id += 1
+        request_id = self.request_id
+        payload = json.dumps({"command": command, "request_id": request_id}).encode("utf-8") + b"\n"
+        assert self.sock is not None
+        self.sock.sendall(payload)
+
+        if not self.reader:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                line = self.reader.readline()
+            except socket.timeout:
+                return None
+            if not line:
+                return None
+            try:
+                response = json.loads(line)
+            except Exception:
+                continue
+            if response.get("request_id") == request_id:
+                return response
+        return None
+
+    def _command(self, command: list[Any], timeout: float = 0.25) -> dict[str, Any] | None:
+        with self.socket_lock:
+            try:
+                return self._send_command_unlocked(command, timeout=timeout)
+            except Exception:
+                try:
+                    if self.reader:
+                        self.reader.close()
+                    if self.sock:
+                        self.sock.close()
+                except Exception:
+                    pass
+                self.reader = None
+                self.sock = None
+                try:
+                    self._connect()
+                    return self._send_command_unlocked(command, timeout=timeout)
+                except Exception:
+                    return None
+
+    def _set_pause(self, paused: bool) -> None:
+        if self.last_pause == paused:
+            return
+        self._command(["set_property", "pause", paused])
+        self.last_pause = paused
+
+    def _set_speed(self, speed: float) -> None:
+        speed = clamp(speed, 0.01, 100.0)
+        if self.last_speed is not None and abs(self.last_speed - speed) < 0.01:
+            return
+        self._command(["set_property", "speed", speed])
+        self.last_speed = speed
+
+    def _seek(self, seconds: float, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_seek_at < 0.18:
+            return
+        self._command(["set_property", "time-pos", max(0.0, seconds)])
+        self.last_seek_at = now
+
+    def _load_black(self) -> None:
+        key = ("black",)
+        if self.loaded_key != key:
+            self._command(["loadfile", str(MPV_BLACK_IMAGE), "replace"])
+            self.loaded_key = key
+            self.last_pause = None
+            self.last_speed = None
+        self._set_speed(1.0)
+        self._set_pause(True)
+
+    def _direction_for_state(self, state: dict[str, Any]) -> int:
+        switch_direction = int(state.get("switch_direction") or 0)
+        if switch_direction:
+            self.last_direction = 1 if switch_direction > 0 else -1
+            return self.last_direction
+
+        position_pct = float(state.get("position_pct") or 0.0)
+        for key in ("active_target_pct", "target_pct"):
+            value = state.get(key)
+            if isinstance(value, (int, float)) and abs(float(value) - position_pct) > 0.05:
+                self.last_direction = 1 if float(value) > position_pct else -1
+                return self.last_direction
+        return self.last_direction
+
+    def _image_plan(self, sequence: SequenceItem, state: dict[str, Any], direction: int) -> dict[str, Any]:
+        duty = float(state.get("speed_duty") or 1.0)
+        stride, requested_fps, duration_sec = frame_stride_for_sequence(sequence, direction, duty, self.fps_cap)
+        last_index = max(0, sequence.frame_count - 1)
+        indexes = list(range(0, last_index + 1, stride))
+        if indexes[-1] != last_index:
+            indexes.append(last_index)
+        if direction < 0:
+            indexes.reverse()
+
+        frame_count = max(1, len(indexes))
+        fps = clamp((frame_count - 1) / max(0.01, duration_sec), 0.1, self.fps_cap)
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.id)[:80] or "sequence"
+        playlist_path = self.playlist_dir / f"{safe_id}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
+
+        if not playlist_path.exists():
+            playlist_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = []
+            for index in indexes:
+                relative_path = sequence.frame_paths[index]
+                lines.append(str((MEDIA_ROOT / relative_path).resolve()))
+            playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        return {
+            "key": ("images", sequence.id, direction, stride, sequence.frame_count, round(fps, 3)),
+            "source": f"mf://@{playlist_path}",
+            "options": {"mf-fps": f"{fps:.6f}"},
+            "duration_sec": duration_sec,
+            "fps": fps,
+            "stride": stride,
+            "requested_fps": requested_fps,
+        }
+
+    def _load_source(self, key: tuple[Any, ...], source: str, options: dict[str, Any] | None = None) -> bool:
+        if self.loaded_key == key:
+            return True
+        if options and "mf-fps" in options:
+            try:
+                self._command(["set_property", "mf-fps", float(options["mf-fps"])])
+            except Exception:
+                pass
+        response = self._command(["loadfile", source, "replace"], timeout=0.5)
+        if not response or response.get("error") != "success":
+            error = response.get("error") if response else "no response"
+            self.loaded_key = None
+            self.controller.set_display_backend_status("mpv", f"MPV load failed: {error}")
+            return False
+        self.loaded_key = key
+        self.last_pause = None
+        self.last_speed = None
+        self.last_seek_at = 0.0
+        return True
+
+    def _duration_for_loaded_video(self, key: tuple[Any, ...]) -> float | None:
+        cached = self.duration_cache.get(key)
+        if cached:
+            return cached
+        response = self._command(["get_property", "duration"], timeout=0.4)
+        duration = response.get("data") if response else None
+        if isinstance(duration, (int, float)) and duration > 0:
+            self.duration_cache[key] = float(duration)
+            return float(duration)
+        return None
+
+    def _sync_images(self, sequence: SequenceItem, state: dict[str, Any], ratio: float, direction: int, moving: bool) -> None:
+        plan = self._image_plan(sequence, state, direction)
+        if not self._load_source(plan["key"], plan["source"], plan["options"]):
+            self._load_black()
+            return
+        playback_ratio = ratio if direction >= 0 else 1.0 - ratio
+        self._set_speed(1.0)
+        if not moving:
+            self._set_pause(True)
+            self._seek(playback_ratio * plan["duration_sec"], force=True)
+            return
+        if self.last_pause is not False:
+            self._seek(playback_ratio * plan["duration_sec"], force=True)
+        self._set_pause(False)
+
+    def _sync_video(self, sequence: SequenceItem, state: dict[str, Any], ratio: float, direction: int, moving: bool) -> None:
+        source_path = (MEDIA_ROOT / sequence.relative_path).resolve()
+        key = ("video", sequence.id, str(source_path))
+        if not self._load_source(key, str(source_path)):
+            self._load_black()
+            return
+        duration = self._duration_for_loaded_video(key)
+        if not duration:
+            self._set_pause(True)
+            return
+
+        duty = float(state.get("speed_duty") or 1.0)
+        travel_duration = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
+        target_time = clamp(ratio, 0.0, 1.0) * duration
+
+        if not moving or direction < 0:
+            self._set_pause(True)
+            self._seek(target_time, force=not moving)
+            return
+
+        self._set_speed(duration / travel_duration)
+        if self.last_pause is not False:
+            self._seek(target_time, force=True)
+        self._set_pause(False)
+
+    def _sync_state(self) -> None:
+        state = self.controller.get_state()
+        sequence = self.controller.library.get(state.get("selected_sequence_id"))
+        if not sequence:
+            self._load_black()
+            return
+
+        position_pct = float(state.get("position_pct") or 0.0)
+        ratio = sequence.playback_ratio_for_pct(position_pct)
+        if ratio is None:
+            self._load_black()
+            return
+
+        direction = self._direction_for_state(state)
+        moving = bool(state.get("is_moving")) and not bool(state.get("is_paused"))
+        if sequence.kind == "images":
+            self._sync_images(sequence, state, ratio, direction, moving)
+        elif sequence.kind == "video":
+            self._sync_video(sequence, state, ratio, direction, moving)
+        else:
+            self._load_black()
+
+    def _run_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if self.process and self.process.poll() is not None:
+                    self.controller.set_display_backend_status("browser", "MPV exited; use /display")
+                    try:
+                        MPV_PID_FILE.unlink()
+                    except Exception:
+                        pass
+                    return
+                self._sync_state()
+            except Exception as exc:
+                self.controller.set_display_backend_status("mpv", f"MPV sync error: {exc}")
+            sleep_time = 0.05
+            try:
+                with self.controller.hardware.lock:
+                    moving = self.controller.hardware.is_moving and not self.controller.hardware.is_paused
+                sleep_time = 0.05 if moving else 0.2
+            except Exception:
+                pass
+            self.stop_event.wait(sleep_time)
+
+
 def request_gpio_lines(require_gpio: bool = False) -> Any:
     output_offsets = (RPWM, LPWM, REN, LEN)
     input_offsets = (SW_EXTEND_IN, SW_RETRACT_IN)
@@ -1721,6 +2142,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"HTTP bind host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP bind port (default: {DEFAULT_PORT})")
     parser.add_argument("--require-gpio", action="store_true", help="Exit instead of running in simulation mode if GPIO is unavailable")
+    parser.add_argument(
+        "--display-backend",
+        choices=("browser", "mpv", "none"),
+        default=os.environ.get("TIME_VOLUME_DISPLAY_BACKEND", DEFAULT_DISPLAY_BACKEND),
+        help=f"Fullscreen display backend to manage from the server (default: {DEFAULT_DISPLAY_BACKEND})",
+    )
+    parser.add_argument("--mpv-bin", default=os.environ.get("TIME_VOLUME_MPV_BIN", "mpv"), help="MPV executable for --display-backend mpv")
+    parser.add_argument("--mpv-fps-cap", type=float, default=float(os.environ.get("TIME_VOLUME_MPV_FPS_CAP", MPV_DEFAULT_FPS_CAP)), help="Maximum sampled image-sequence FPS for MPV")
     return parser
 
 
@@ -1759,6 +2188,14 @@ def main() -> None:
         if PiCameraRuntime is not None
         else None
     )
+    mpv_display: MpvDisplayBackend | None = None
+    if args.display_backend == "mpv":
+        mpv_display = MpvDisplayBackend(controller, mpv_bin=args.mpv_bin, fps_cap=args.mpv_fps_cap)
+        if not mpv_display.start():
+            mpv_display = None
+    elif args.display_backend == "none":
+        controller.set_display_backend_status("none", "No fullscreen display backend")
+
     server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
 
     print_launch_hints(args.host, args.port)
@@ -1769,6 +2206,8 @@ def main() -> None:
     finally:
         server.shutdown()
         server.server_close()
+        if mpv_display:
+            mpv_display.stop()
         controller.shutdown()
         if req:
             try:

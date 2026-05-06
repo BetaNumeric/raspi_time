@@ -806,6 +806,10 @@
                     <span class="hero-status-label">Media</span>
                     <span id="libraryValue" class="hero-status-value">0</span>
                 </div>
+                <div class="hero-status-item">
+                    <span class="hero-status-label">Display</span>
+                    <span id="displayBackendValue" class="hero-status-value">Browser</span>
+                </div>
             </div>
         </section>
 
@@ -1097,6 +1101,7 @@
         const targetValue = $("#targetValue");
         const switchValue = $("#switchValue");
         const libraryValue = $("#libraryValue");
+        const displayBackendValue = $("#displayBackendValue");
         const modePill = $("#modePill");
         const countdownPill = $("#countdownPill");
         const simulationPill = $("#simulationPill");
@@ -1854,6 +1859,8 @@
             targetValue.textContent = `${displayTarget.toFixed(1)}%`;
             switchValue.textContent = state.switch_label;
             libraryValue.textContent = `${libraryItems.length}`;
+            displayBackendValue.textContent = state.display_backend_status || state.display_backend_mode || "Browser";
+            displayBackendValue.title = state.display_backend_status || "";
             modePill.textContent = motionLabel(state);
             countdownPill.textContent = state.countdown_deadline_ms
                 ? `Start ${formatTimer(state.countdown_remaining)}`

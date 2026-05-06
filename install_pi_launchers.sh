@@ -22,7 +22,7 @@ Type=Application
 Name=Start Time Volume
 Comment=Start the Time Volume server and fullscreen display
 Path=$SCRIPT_DIR
-Exec=$SCRIPT_DIR/start_time_volume.sh
+Exec=env TIME_VOLUME_DISPLAY_BACKEND=mpv $SCRIPT_DIR/start_time_volume.sh
 Terminal=false
 Categories=AudioVideo;Graphics;
 EOF

@@ -37,7 +37,7 @@ python3 actuator_web.py --host 0.0.0.0 --port 8000
 Then open:
 
 - Controller: `http://<pi-address>:8000/controller`
-- Display: `http://127.0.0.1:8000/display`
+- Browser display fallback: `http://127.0.0.1:8000/display`
 - Camera: `https://betanumeric.github.io/volumetric_time_camera/`
 
 Camera access from phones/tablets usually requires HTTPS, except on `localhost`.
@@ -49,6 +49,27 @@ For the Pi kiosk flow, run:
 ```bash
 ./start_time_volume.sh
 ```
+
+Desktop autostart created by `./install_pi_launchers.sh --autostart` uses the
+same MPV display backend.
+
+The default display backend is a dedicated fullscreen MPV process. To run the
+monitor through the browser fallback at `/display` instead:
+
+```bash
+TIME_VOLUME_DISPLAY_BACKEND=browser ./start_time_volume.sh
+```
+
+Install MPV on the Pi first if it is not already present:
+
+```bash
+sudo apt install mpv
+```
+
+MPV supports both video files and image-sequence folders. Image folders are
+handed to MPV as sampled frame lists capped at 30 fps by default; change that
+cap with `TIME_VOLUME_MPV_FPS_CAP=24` if needed. If MPV is missing or fails to
+start, the launcher falls back to the web display at `/display`.
 
 ## Camera App
 
@@ -101,7 +122,9 @@ control path or a dedicated motor controller that does not depend on the Pi
 booting first.
 
 The boot service requires GPIO access. If GPIO is unavailable, systemd will keep
-retrying instead of starting in simulation mode.
+retrying instead of starting in simulation mode. By default, this service starts
+only the actuator server; the desktop launcher/autostart starts the MPV display
+once the graphical session is available.
 
 ## Runtime Files
 
