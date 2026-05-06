@@ -51,7 +51,9 @@ For the Pi kiosk flow, run:
 ```
 
 Desktop autostart created by `./install_pi_launchers.sh --autostart` uses the
-same MPV display backend.
+same MPV display backend. If the boot service is already running, the launcher
+now asks that live server to start MPV instead of trying to replace the server,
+which keeps the switch polling online as early as possible.
 
 The default display backend is a dedicated fullscreen MPV process. To run the
 monitor through the browser fallback at `/display` instead:
@@ -123,8 +125,8 @@ booting first.
 
 The boot service requires GPIO access. If GPIO is unavailable, systemd will keep
 retrying instead of starting in simulation mode. By default, this service starts
-only the actuator server; the desktop launcher/autostart starts the MPV display
-once the graphical session is available.
+only the actuator server; the desktop launcher/autostart can then enable the MPV
+display once the graphical session is available.
 
 ## Runtime Files
 

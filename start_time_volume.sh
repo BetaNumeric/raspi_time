@@ -68,16 +68,29 @@ except Exception:
 PY
 }
 
-start_server() {
-    if server_is_healthy; then
-        if [[ "$DISPLAY_BACKEND" == "mpv" && ! -f "$MPV_PID_FILE" && -f "$PID_FILE" ]]; then
-            stop_pid_file "$PID_FILE"
-            sleep 1
-        else
-            return 0
-        fi
-    fi
+start_mpv_display() {
+    python3 - "$PORT" <<'PY'
+import json
+import sys
+import urllib.request
 
+port = sys.argv[1]
+url = f"http://127.0.0.1:{port}/api/action"
+payload = json.dumps({"action": "start_display"}).encode("utf-8")
+request = urllib.request.Request(
+    url,
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+
+with urllib.request.urlopen(request, timeout=15.0) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+PY
+}
+
+start_server() {
     if server_is_healthy; then
         return 0
     fi
@@ -177,7 +190,12 @@ fi
 start_server
 
 if wait_for_server; then
-    if [[ "$DISPLAY_BACKEND" != "mpv" && "$DISPLAY_BACKEND" != "none" ]]; then
+    if [[ "$DISPLAY_BACKEND" == "mpv" ]]; then
+        if ! start_mpv_display; then
+            echo "Server is running, but MPV display could not be started. Check $LOG_FILE"
+            exit 1
+        fi
+    elif [[ "$DISPLAY_BACKEND" != "none" ]]; then
         launch_browser
     fi
     print_urls

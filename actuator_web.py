@@ -536,7 +536,7 @@ class ActuatorHardware:
 
 
 class InstallationController:
-    def __init__(self, req: Any):
+    def __init__(self, req: Any, mpv_bin: str = "mpv", mpv_fps_cap: float = MPV_DEFAULT_FPS_CAP):
         self.hardware = ActuatorHardware(req)
         if req:
             self.hardware.enable(False)
@@ -572,6 +572,10 @@ class InstallationController:
         self.settings_save_timer: threading.Timer | None = None
         self.display_backend_mode = "browser"
         self.display_backend_status = "HTML display fallback"
+        self.mpv_bin = mpv_bin
+        self.mpv_fps_cap = mpv_fps_cap
+        self.mpv_display: MpvDisplayBackend | None = None
+        self.display_backend_lock = threading.Lock()
 
         self.switch_raw_dir = 0
         self.switch_stable_dir = 0
@@ -684,6 +688,29 @@ class InstallationController:
         with self.state_lock:
             self.display_backend_mode = mode
             self.display_backend_status = status
+
+    def start_mpv_display(self) -> bool:
+        with self.display_backend_lock:
+            if self.mpv_display and self.mpv_display.process and self.mpv_display.process.poll() is None:
+                self.set_display_backend_status("mpv", "MPV fullscreen display")
+                return True
+
+            if self.mpv_display:
+                self.mpv_display.stop()
+
+            backend = MpvDisplayBackend(self, mpv_bin=self.mpv_bin, fps_cap=self.mpv_fps_cap)
+            self.mpv_display = backend
+            if backend.start():
+                return True
+
+            self.mpv_display = None
+            return False
+
+    def stop_mpv_display(self) -> None:
+        with self.display_backend_lock:
+            if self.mpv_display:
+                self.mpv_display.stop()
+                self.mpv_display = None
 
     def get_state(self) -> dict[str, Any]:
         with self.hardware.lock:
@@ -1312,6 +1339,7 @@ class InstallationController:
     def shutdown(self) -> None:
         self.shutdown_event.set()
         self.stop_all()
+        self.stop_mpv_display()
         self._cancel_scheduled_settings_save()
         self._save_settings()
 
@@ -1445,6 +1473,11 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.play_pause()
             elif action == "stop":
                 controller.stop_all()
+            elif action == "start_display":
+                if not controller.start_mpv_display():
+                    raise RuntimeError("MPV display failed to start")
+            elif action == "stop_display":
+                controller.stop_mpv_display()
             elif action == "home":
                 controller.home()
             elif action == "cycle_toggle":
@@ -2181,18 +2214,16 @@ def main() -> None:
     WEB_DIR.mkdir(parents=True, exist_ok=True)
 
     req = request_gpio_lines(require_gpio=args.require_gpio)
-    controller = InstallationController(req)
+    controller = InstallationController(req, mpv_bin=args.mpv_bin, mpv_fps_cap=args.mpv_fps_cap)
     ActuatorRequestHandler.controller = controller
     ActuatorRequestHandler.pi_camera = (
         PiCameraRuntime(BASE_DIR / "experiments" / "pi_long_exposure" / "captures")
         if PiCameraRuntime is not None
         else None
     )
-    mpv_display: MpvDisplayBackend | None = None
     if args.display_backend == "mpv":
-        mpv_display = MpvDisplayBackend(controller, mpv_bin=args.mpv_bin, fps_cap=args.mpv_fps_cap)
-        if not mpv_display.start():
-            mpv_display = None
+        if not controller.start_mpv_display():
+            controller.set_display_backend_status("browser", "MPV display unavailable; use /display")
     elif args.display_backend == "none":
         controller.set_display_backend_status("none", "No fullscreen display backend")
 
@@ -2206,8 +2237,6 @@ def main() -> None:
     finally:
         server.shutdown()
         server.server_close()
-        if mpv_display:
-            mpv_display.stop()
         controller.shutdown()
         if req:
             try:

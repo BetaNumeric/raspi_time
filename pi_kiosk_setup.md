@@ -58,6 +58,10 @@ If you want it to auto-start at login too:
 ./install_pi_launchers.sh --autostart
 ```
 
+If the boot service is already running, the launcher will reuse that server and
+turn on MPV there, so the switch stays available before the desktop session is
+ready.
+
 ## 1. Start switch control on boot
 
 The physical switch is polled by `actuator_web.py`. To make that available as
@@ -93,6 +97,10 @@ Save as:
 ```
 
 On some Pi images the browser command is `chromium` instead of `chromium-browser`.
+
+If the server is already up from the boot service, this launcher does not replace
+it. It asks the live server to start MPV, which is what makes the display appear
+after login without losing early switch polling.
 
 ## Why this setup
 
