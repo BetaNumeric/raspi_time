@@ -52,6 +52,17 @@ For a boot-managed server, pass the override during install:
 sudo env TIME_VOLUME_CAMERA_URL=https://example.com/camera/ ./install_boot_service.sh
 ```
 
+The monitor shows a QR code during standby/cycle pauses. It still scans as the
+camera app URL, with sync timing in a `tvs` query parameter. Turn on **QR Sync**
+inside the camera app settings to let the PWA read that code and schedule the
+long-exposure stack automatically, or set **QR Action** to **Info only** to
+show the decoded timing without starting a capture. iPhones use the camera
+app's JavaScript QR decoder fallback. The controller's Advanced settings have
+**Show QR**, **QR Info Text**, and one **QR Blackout** delay. That delay is used
+both before motion starts and after motion ends, defaults to 5 seconds, and
+shows a black screen instead of frames. The MPV QR screen centers the QR and
+shows large rotated countdown numbers along the left and right edges.
+
 If you want it to auto-start at login too:
 
 ```bash

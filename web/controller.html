@@ -1058,6 +1058,21 @@
                         <input id="speedRange" type="range" min="0.1" max="1" step="0.05" value="1">
                         <div class="hint" id="speedValue">100%</div>
                     </div>
+                    <div class="field">
+                        <label for="qrSyncEnabledInput">Show QR</label>
+                        <input id="qrSyncEnabledInput" type="checkbox" checked>
+                    </div>
+                    <div class="field">
+                        <label for="qrSyncDebugInput">QR Info Text</label>
+                        <input id="qrSyncDebugInput" type="checkbox" checked>
+                    </div>
+                    <div class="field">
+                        <label class="range-label" for="qrSyncGuardRange">
+                            <span>QR Blackout</span>
+                            <span id="qrSyncGuardValue" class="range-value">5s</span>
+                        </label>
+                        <input id="qrSyncGuardRange" type="range" min="0" max="30" step="0.25" value="5">
+                    </div>
                 </section>
 
                 <section>
@@ -1110,6 +1125,10 @@
         const delayInput = $("#delayInput");
         const speedRange = $("#speedRange");
         const speedValue = $("#speedValue");
+        const qrSyncEnabledInput = $("#qrSyncEnabledInput");
+        const qrSyncDebugInput = $("#qrSyncDebugInput");
+        const qrSyncGuardRange = $("#qrSyncGuardRange");
+        const qrSyncGuardValue = $("#qrSyncGuardValue");
         const cycleRandom = $("#cycleRandom");
         const pauseExtendInput = $("#pauseExtendInput");
         const pauseRetractInput = $("#pauseRetractInput");
@@ -1174,6 +1193,7 @@
         const MIN_SEQUENCE_HEIGHT_CM = 0.01;
         const DEFAULT_EXTEND_SEC = 23.75;
         const DEFAULT_RETRACT_SEC = 22.0;
+        const DEFAULT_QR_GUARD_SEC = 5;
         const MAX_SEQUENCE_PLAYBACK_FPS = 30;
         const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 
@@ -1572,6 +1592,14 @@
             speedValue.textContent = `${Math.round(Number(value) * 100)}%`;
         }
 
+        function formatQrDelay(value) {
+            return `${Number(value || 0).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}s`;
+        }
+
+        function syncQrSettingsUi() {
+            qrSyncGuardValue.textContent = formatQrDelay(qrSyncGuardRange.value);
+        }
+
         function formatCm(value) {
             return `${Number(value || 0).toFixed(1).replace(/\.0$/, "")} cm`;
         }
@@ -1693,6 +1721,10 @@
             syncFieldValue(delayInput, state.delay_sec);
             syncFieldValue(speedRange, state.speed_duty);
             if (!isFieldActive(speedRange)) updateSpeedLabel(state.speed_duty);
+            qrSyncEnabledInput.checked = state.qr_sync_enabled !== false;
+            qrSyncDebugInput.checked = state.qr_sync_debug_enabled !== false;
+            syncFieldValue(qrSyncGuardRange, state.qr_sync_guard_sec ?? DEFAULT_QR_GUARD_SEC);
+            syncQrSettingsUi();
             syncFieldValue(cycleRandom, String(state.cycle_random));
             syncFieldValue(pauseExtendInput, state.cycle_pause_extend_sec);
             syncFieldValue(pauseRetractInput, state.cycle_pause_retract_sec);
@@ -2105,6 +2137,25 @@
             speedDebounce = setTimeout(() => pushSettings({ speed_duty: Number(speedRange.value) }).catch(() => {}), 120);
         });
 
+        qrSyncEnabledInput.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_enabled: qrSyncEnabledInput.checked }).catch(() => {});
+        });
+
+        qrSyncDebugInput.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_debug_enabled: qrSyncDebugInput.checked }).catch(() => {});
+        });
+
+        qrSyncGuardRange.addEventListener("input", () => {
+            holdFormSync();
+            syncQrSettingsUi();
+        });
+        qrSyncGuardRange.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_guard_sec: Number(qrSyncGuardRange.value) }).catch(() => {});
+        });
+
         delayInput.addEventListener("input", () => { holdFormSync(2500); });
         pauseExtendInput.addEventListener("input", () => { holdFormSync(2500); });
         pauseRetractInput.addEventListener("input", () => { holdFormSync(2500); });
@@ -2224,6 +2275,7 @@
         (async () => {
             updateTargetInputs(0);
             updateSpeedLabel(1);
+            syncQrSettingsUi();
             await loadLibrary();
             refreshStateLoop();
         })();

@@ -85,6 +85,21 @@ The Pi controller uses that URL by default. The local `/camera/` route redirects
 there, and the controller/display/actuator stack no longer depends on local
 camera files.
 
+During idle/standby and cycle pauses, the monitor shows a camera QR code. The QR
+opens the camera app URL and carries a compact `tvs` query parameter with the
+next sequence name, direction, countdown, and exposure duration. In the camera
+PWA, enable **QR Sync** in Settings to scan that QR from the live preview and
+auto-start/stop the stack capture when the next lift movement begins. Set
+**QR Action** to **Info only** if you want the camera app to show the decoded
+sequence/timing without starting a capture. The camera app uses the browser QR
+detector when available and falls back to a JavaScript decoder for iPhones. The
+controller's Advanced settings include **Show QR**, **QR Info Text**, and one
+**QR Blackout** delay. The blackout delay is used both before motion starts and
+after motion ends, defaults to 5 seconds, and shows a black screen instead of
+falling back to the selected frame. The MPV QR screen centers the QR and shows
+large rotated countdown numbers on the left and right edges for side viewing.
+The camera PWA expands its top QR status box when tapped.
+
 To point the Pi at a different hosted camera app later:
 
 ```bash

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import mimetypes
@@ -10,15 +12,24 @@ import random
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
+
+from qr_sync import make_qr_matrix, write_qr_png
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover - optional display nicety
+    Image = ImageDraw = ImageFont = None  # type: ignore
 
 try:
     import gpiod  # type: ignore
@@ -78,11 +89,19 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
+QR_SYNC_DEFAULT_GUARD_SEC = 5.0
+QR_SYNC_SETTINGS_VERSION = 3
+QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
+QR_SYNC_CAPTURE_START_LEAD_MS = 500
+QR_SYNC_CAPTURE_STOP_PADDING_MS = 750
+QR_SYNC_DISPLAY_SIZE = (1920, 1080)
+QR_SYNC_IMAGE_CACHE_VERSION = 3
 MPV_DEFAULT_FPS_CAP = 30.0
 DEFAULT_DISPLAY_BACKEND = "mpv"
 MPV_IPC_PATH = RUN_DIR / "time_volume_mpv.sock"
 MPV_PID_FILE = RUN_DIR / "time_volume_mpv.pid"
 MPV_BLACK_IMAGE = RUN_DIR / "mpv_black.png"
+QR_SYNC_DIR = RUN_DIR / "qr_sync"
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -133,6 +152,44 @@ def configured_camera_url() -> str | None:
     if camera_app_available():
         return "/camera/"
     return None
+
+
+def base64url_json(payload: dict[str, Any]) -> str:
+    compact = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(compact).decode("ascii").rstrip("=")
+
+
+def append_url_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params[key] = [value]
+    query = urlencode(params, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
+
+
+def solid_png_bytes(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    def chunk(name: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+
+    row = b"\x00" + bytes(rgb) * width
+    raw = row * height
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+def format_ms(ms: int | float | None) -> str:
+    if ms is None:
+        return "--"
+    seconds = max(0.0, float(ms) / 1000)
+    return f"{seconds:.1f}s" if seconds < 10 else f"{seconds:.0f}s"
+
+
+def direction_label(direction: int | float | None) -> str:
+    value = int(direction or 0)
+    if value > 0:
+        return "Up"
+    if value < 0:
+        return "Down"
+    return "Idle"
 
 
 @dataclass
@@ -567,8 +624,15 @@ class InstallationController:
         self.countdown_event: threading.Event | None = None
         self.cycle_pause_phase: str | None = None
         self.cycle_pause_deadline: float | None = None
+        self.cycle_pending_sequence_id: str | None = None
+        self.cycle_pending_direction: int | None = None
         self.last_cycle_end_reason: str | None = None
         self.last_runtime_error: str | None = None
+        self.qr_sync_enabled = True
+        self.qr_sync_debug_enabled = True
+        self.qr_sync_guard_sec = QR_SYNC_DEFAULT_GUARD_SEC
+        self.qr_sync_was_moving = False
+        self.qr_sync_last_motion_end_at = 0.0
         self.settings_save_timer: threading.Timer | None = None
         self.display_backend_mode = "browser"
         self.display_backend_status = "HTML display fallback"
@@ -602,6 +666,17 @@ class InstallationController:
         self.cycle_pause_extend_sec = max(0.0, float(data.get("cycle_pause_extend_sec", self.cycle_pause_extend_sec)))
         self.cycle_pause_retract_sec = max(0.0, float(data.get("cycle_pause_retract_sec", self.cycle_pause_retract_sec)))
         self.cycle_random = bool(data.get("cycle_random", self.cycle_random))
+        self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
+        self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
+        qr_settings_version = int(coerce_float(data.get("qr_sync_settings_version"), 0))
+        legacy_guard = max(
+            coerce_float(data.get("qr_sync_hide_before_start_sec"), 0.0),
+            coerce_float(data.get("qr_sync_show_after_motion_sec"), 0.0),
+        )
+        guard_fallback = legacy_guard if legacy_guard > 0 else self.qr_sync_guard_sec
+        if qr_settings_version < QR_SYNC_SETTINGS_VERSION and guard_fallback <= 0:
+            guard_fallback = QR_SYNC_DEFAULT_GUARD_SEC
+        self.qr_sync_guard_sec = clamp(coerce_float(data.get("qr_sync_guard_sec"), guard_fallback), 0.0, 60.0)
         selected = data.get("selected_sequence_id")
         self.selected_sequence_id = selected if isinstance(selected, str) else None
 
@@ -615,6 +690,10 @@ class InstallationController:
                 "cycle_pause_retract_sec": round(self.cycle_pause_retract_sec, 2),
                 "cycle_random": self.cycle_random,
                 "selected_sequence_id": self.selected_sequence_id,
+                "qr_sync_enabled": self.qr_sync_enabled,
+                "qr_sync_debug_enabled": self.qr_sync_debug_enabled,
+                "qr_sync_guard_sec": round(self.qr_sync_guard_sec, 2),
+                "qr_sync_settings_version": QR_SYNC_SETTINGS_VERSION,
             }
         temp_path = STATE_FILE.with_suffix(".tmp")
         body = json.dumps(payload, indent=2)
@@ -712,6 +791,287 @@ class InstallationController:
                 self.mpv_display.stop()
                 self.mpv_display = None
 
+    def toggle_qr_sync_display(self) -> None:
+        with self.state_lock:
+            self.qr_sync_enabled = not self.qr_sync_enabled
+
+    def _pick_advanced_sequence_id(self, step: int = 1, randomize: bool = False) -> str | None:
+        ordered = self.library.ordered_ids()
+        if not ordered:
+            return None
+
+        with self.state_lock:
+            current = self.selected_sequence_id
+
+        if current not in ordered:
+            return ordered[0]
+        if randomize and len(ordered) > 1:
+            choices = [sequence_id for sequence_id in ordered if sequence_id != current]
+            return random.choice(choices)
+        return ordered[(ordered.index(current) + step) % len(ordered)]
+
+    def _set_selected_sequence_id(self, sequence_id: str | None, persist: bool = True) -> None:
+        with self.state_lock:
+            self.selected_sequence_id = sequence_id
+        if persist:
+            self._save_settings()
+
+    def _direction_for_snapshot(self, state: dict[str, Any]) -> int:
+        pending_direction = state.get("cycle_pending_direction")
+        if pending_direction in {-1, 1}:
+            return int(pending_direction)
+
+        phase = state.get("cycle_pause_phase")
+        if phase == "top":
+            return -1
+        if phase == "bottom":
+            return 1
+
+        switch_direction = int(state.get("switch_direction") or 0)
+        if switch_direction:
+            return 1 if switch_direction > 0 else -1
+
+        position_pct = float(state.get("position_pct") or 0.0)
+        for key in ("active_target_pct", "target_pct"):
+            value = state.get(key)
+            if isinstance(value, (int, float)) and abs(float(value) - position_pct) > 0.05:
+                return 1 if float(value) > position_pct else -1
+        return 0
+
+    def _qr_sync_sequence(self, state: dict[str, Any]) -> SequenceItem | None:
+        pending_id = state.get("cycle_pending_sequence_id")
+        if isinstance(pending_id, str):
+            sequence = self.library.get(pending_id)
+            if sequence:
+                return sequence
+        return self.library.get(state.get("selected_sequence_id"))
+
+    def _qr_sync_start_in_ms(self, state: dict[str, Any]) -> int | None:
+        server_time_ms = int(state.get("server_time_ms") or 0)
+        for key in ("cycle_pause_deadline_ms", "countdown_deadline_ms"):
+            deadline_ms = state.get(key)
+            if isinstance(deadline_ms, int):
+                return max(0, deadline_ms - server_time_ms)
+        return None
+
+    def _qr_sync_payload_start_in_ms(self, start_in_ms: int | None) -> int | None:
+        if start_in_ms is None:
+            return None
+        quantum = max(1, QR_SYNC_COUNTDOWN_QUANTUM_MS)
+        rounded = int(math.floor(start_in_ms / quantum) * quantum)
+        return max(0, rounded - QR_SYNC_CAPTURE_START_LEAD_MS)
+
+    def _qr_sync_capture_stop_padding_ms(self, state: dict[str, Any]) -> int:
+        guard_ms = int(max(0, float(state.get("qr_sync_guard_sec") or 0.0) * 1000))
+        if guard_ms <= 0:
+            return 0
+        return min(QR_SYNC_CAPTURE_STOP_PADDING_MS, max(0, guard_ms - 500))
+
+    def _qr_sync_phase(self, state: dict[str, Any]) -> str:
+        phase = state.get("cycle_pause_phase")
+        if isinstance(phase, str) and phase:
+            return phase
+        if state.get("countdown_deadline_ms"):
+            return "countdown"
+        if state.get("is_moving") and state.get("is_paused"):
+            return "paused"
+        if state.get("is_cycling"):
+            return "cycle"
+        return "idle"
+
+    def _qr_sync_blackout_reason(self, state: dict[str, Any], start_in_ms: int | None, payload_start_in_ms: int | None) -> str | None:
+        guard_ms = max(0, float(state.get("qr_sync_guard_sec") or 0.0) * 1000)
+        effective_start_in_ms = payload_start_in_ms if payload_start_in_ms is not None else start_in_ms
+        if effective_start_in_ms is not None:
+            if guard_ms > 0 and effective_start_in_ms <= guard_ms:
+                return "before_start"
+
+        if state.get("countdown_deadline_ms") is None:
+            last_motion_end_ms = state.get("qr_sync_last_motion_end_ms")
+            if guard_ms > 0 and isinstance(last_motion_end_ms, int):
+                elapsed_ms = int(state.get("server_time_ms") or 0) - last_motion_end_ms
+                if 0 <= elapsed_ms < guard_ms:
+                    return "after_motion"
+        return None
+
+    def _qr_sync_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        camera_url = state.get("camera_url")
+        start_in_ms = self._qr_sync_start_in_ms(state)
+        payload_start_in_ms = self._qr_sync_payload_start_in_ms(start_in_ms)
+
+        standby_clear = not bool(state.get("is_moving")) and int(state.get("switch_direction") or 0) == 0
+        qr_enabled = bool(state.get("qr_sync_enabled", True))
+        blackout_reason = self._qr_sync_blackout_reason(state, start_in_ms, payload_start_in_ms)
+        timing_blackout = blackout_reason in {"before_start", "after_motion"}
+        display_mode = "normal"
+        if bool(camera_url) and standby_clear:
+            if not qr_enabled:
+                display_mode = "black"
+                blackout_reason = "disabled"
+            elif blackout_reason:
+                display_mode = "black"
+            else:
+                display_mode = "qr"
+        display_active = display_mode == "qr"
+        standby_blackout = display_mode == "black"
+
+        payload: dict[str, Any] | None = None
+        sync_url = camera_url
+        sync_hash = None
+        label = "Camera QR"
+
+        if camera_url:
+            sequence = self._qr_sync_sequence(state)
+            direction = self._direction_for_snapshot(state)
+
+            duration_ms = None
+            if sequence:
+                duration_direction = direction if direction in {-1, 1} else 1
+                duration_ms = int(round(sequence_travel_duration_sec(sequence, duration_direction, float(state.get("speed_duty") or 1.0)) * 1000))
+                label = sequence.name
+            payload_duration_ms = duration_ms
+            if duration_ms is not None and start_in_ms is not None and payload_start_in_ms is not None:
+                payload_duration_ms += max(0, start_in_ms - payload_start_in_ms)
+                payload_duration_ms += self._qr_sync_capture_stop_padding_ms(state)
+
+            payload = {
+                "v": 1,
+                "si": payload_start_in_ms,
+                "du": payload_duration_ms,
+                "d": direction,
+                "ph": self._qr_sync_phase(state),
+            }
+            if sequence:
+                payload.update(
+                    {
+                        "id": sequence.id[:72],
+                        "n": sequence.name[:48],
+                        "k": "i" if sequence.kind == "images" else "v",
+                        "fr": int(sequence.frame_count or 0),
+                        "st": round(sequence.start_cm, 2),
+                        "en": round(sequence.end_cm, 2),
+                        "h": round(sequence.volume_height_cm, 2),
+                    }
+                )
+            sync_url = append_url_param(str(camera_url), "tvs", base64url_json(payload))
+            sync_hash = hashlib.sha1(f"qr{QR_SYNC_IMAGE_CACHE_VERSION}|{sync_url}".encode("utf-8")).hexdigest()[:16]
+
+        return {
+            "qr_sync_display_active": display_active,
+            "qr_sync_payload": payload,
+            "qr_sync_url": sync_url,
+            "qr_sync_hash": sync_hash,
+            "qr_sync_label": label,
+            "qr_sync_enabled": qr_enabled,
+            "qr_sync_debug_enabled": bool(state.get("qr_sync_debug_enabled", True)),
+            "qr_sync_auto_active": display_active,
+            "qr_sync_standby_blackout": standby_blackout,
+            "qr_sync_display_mode": display_mode,
+            "qr_sync_countdown_ms": start_in_ms,
+            "qr_sync_blackout_reason": blackout_reason,
+            "qr_sync_timing_blackout": timing_blackout,
+        }
+
+    def get_qr_sync_image_path(self, state: dict[str, Any] | None = None) -> Path:
+        if state is None:
+            state = self.get_state()
+        sync_url = state.get("qr_sync_url") or configured_camera_url()
+        if not sync_url:
+            raise RuntimeError("Camera URL is not configured")
+
+        digest = state.get("qr_sync_hash") or hashlib.sha1(f"qr{QR_SYNC_IMAGE_CACHE_VERSION}|{sync_url}".encode("utf-8")).hexdigest()[:16]
+        path = QR_SYNC_DIR / f"{digest}.png"
+        if not path.exists():
+            self._write_qr_sync_display_png(str(sync_url), state, path)
+            self._trim_qr_sync_cache()
+        return path
+
+    def _trim_qr_sync_cache(self, keep: int = 48) -> None:
+        try:
+            files = sorted(QR_SYNC_DIR.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True)
+            for old_file in files[keep:]:
+                old_file.unlink()
+        except Exception:
+            pass
+
+    def _qr_sync_debug_lines(self, state: dict[str, Any]) -> list[str]:
+        payload = state.get("qr_sync_payload") if isinstance(state.get("qr_sync_payload"), dict) else {}
+        return [
+            "QR SYNC",
+            f"NEXT: {payload.get('n') or state.get('qr_sync_label') or 'CAMERA'}",
+            f"STARTS IN: {format_ms(payload.get('si'))}",
+            f"CAPTURE: {format_ms(payload.get('du'))}",
+            f"DIRECTION: {direction_label(payload.get('d'))}",
+            f"PHASE: {payload.get('ph') or 'idle'}",
+            f"FRAMES: {payload.get('fr') or '--'}",
+            f"BLACKOUT: {format_ms(float(state.get('qr_sync_guard_sec') or 0.0) * 1000)}",
+        ]
+
+    def _write_qr_sync_display_png(self, sync_url: str, state: dict[str, Any], path: Path) -> None:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            write_qr_png(sync_url, path, scale=18, border=8)
+            return
+
+        width, height = QR_SYNC_DISPLAY_SIZE
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        matrix = make_qr_matrix(sync_url)
+        border = 8
+        qr_side = min(height - 170, int(width * 0.52))
+        scale = max(1, qr_side // (len(matrix) + border * 2))
+        pixel_size = (len(matrix) + border * 2) * scale
+        qr_x = (width - pixel_size) // 2
+        qr_y = (height - pixel_size) // 2
+
+        draw.rectangle((qr_x, qr_y, qr_x + pixel_size, qr_y + pixel_size), fill="white")
+        for module_y, row in enumerate(matrix):
+            y0 = qr_y + (module_y + border) * scale
+            for module_x, dark in enumerate(row):
+                if dark:
+                    x0 = qr_x + (module_x + border) * scale
+                    draw.rectangle((x0, y0, x0 + scale - 1, y0 + scale - 1), fill="black")
+
+        try:
+            side_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 180)
+            title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+            body_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
+        except Exception:
+            side_font = title_font = body_font = ImageFont.load_default()
+
+        payload = state.get("qr_sync_payload") if isinstance(state.get("qr_sync_payload"), dict) else {}
+        countdown_text = format_ms(payload.get("si"))
+        side_margin = 100
+        for angle, x in ((-90, side_margin), (90, width - side_margin)):
+            text_box = draw.textbbox((0, 0), countdown_text, font=side_font)
+            text_w = max(1, text_box[2] - text_box[0])
+            text_h = max(1, text_box[3] - text_box[1])
+            text_image = Image.new("RGBA", (text_w + 28, text_h + 28), (255, 255, 255, 0))
+            text_draw = ImageDraw.Draw(text_image)
+            text_draw.text((14 - text_box[0], 14 - text_box[1]), countdown_text, fill="black", font=side_font)
+            rotated = text_image.rotate(angle, expand=True)
+            image.paste(rotated, (int(x - rotated.width / 2), int(height / 2 - rotated.height / 2)), rotated)
+
+        if not bool(state.get("qr_sync_debug_enabled", True)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            image.save(temp_path, format="PNG", optimize=True)
+            temp_path.replace(path)
+            return
+
+        lines = self._qr_sync_debug_lines(state)
+        title = lines[0]
+        title_box = draw.textbbox((0, 0), title, font=title_font)
+        draw.text(((width - (title_box[2] - title_box[0])) / 2, 26), title, fill="black", font=title_font)
+        info_text = "  |  ".join(lines[1:])
+        info_box = draw.textbbox((0, 0), info_text, font=body_font)
+        info_x = max(24, (width - (info_box[2] - info_box[0])) / 2)
+        draw.text((info_x, height - 58), info_text[:150], fill="black", font=body_font)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        image.save(temp_path, format="PNG", optimize=True)
+        temp_path.replace(path)
+
     def get_state(self) -> dict[str, Any]:
         with self.hardware.lock:
             position_pct = round(self.hardware.position_pct, 2)
@@ -733,12 +1093,25 @@ class InstallationController:
             switch_direction = self.switch_stable_dir
             cycle_pause_phase = self.cycle_pause_phase
             cycle_pause_deadline = self.cycle_pause_deadline
+            cycle_pending_sequence_id = self.cycle_pending_sequence_id
+            cycle_pending_direction = self.cycle_pending_direction
             last_cycle_end_reason = self.last_cycle_end_reason
             last_runtime_error = self.last_runtime_error
+            qr_sync_enabled = self.qr_sync_enabled
+            qr_sync_debug_enabled = self.qr_sync_debug_enabled
+            qr_sync_guard_sec = round(self.qr_sync_guard_sec, 2)
             display_backend_mode = self.display_backend_mode
             display_backend_status = self.display_backend_status
 
         now = time.time()
+        with self.state_lock:
+            if is_moving:
+                self.qr_sync_was_moving = True
+            elif self.qr_sync_was_moving:
+                self.qr_sync_was_moving = False
+                self.qr_sync_last_motion_end_at = now
+            qr_sync_last_motion_end_at = self.qr_sync_last_motion_end_at
+
         countdown_remaining = 0
         deadline_ms = None
         if countdown_deadline is not None:
@@ -753,13 +1126,15 @@ class InstallationController:
             cycle_pause_remaining_ms = max(0, int((cycle_pause_deadline - now) * 1000))
 
         sequence = self.library.get(selected_sequence_id)
-        return {
+        state = {
             "server_time_ms": int(now * 1000),
             "countdown_deadline_ms": deadline_ms,
             "countdown_remaining": countdown_remaining,
             "cycle_pause_phase": cycle_pause_phase,
             "cycle_pause_deadline_ms": cycle_pause_deadline_ms,
             "cycle_pause_remaining_ms": cycle_pause_remaining_ms,
+            "cycle_pending_sequence_id": cycle_pending_sequence_id,
+            "cycle_pending_direction": cycle_pending_direction,
             "last_cycle_end_reason": last_cycle_end_reason,
             "position_pct": position_pct,
             "target_pct": target_pct,
@@ -796,7 +1171,13 @@ class InstallationController:
             "display_backend_mode": display_backend_mode,
             "display_backend_status": display_backend_status,
             "camera_url": configured_camera_url(),
+            "qr_sync_enabled": qr_sync_enabled,
+            "qr_sync_debug_enabled": qr_sync_debug_enabled,
+            "qr_sync_guard_sec": qr_sync_guard_sec,
+            "qr_sync_last_motion_end_ms": int(qr_sync_last_motion_end_at * 1000) if qr_sync_last_motion_end_at > 0 else None,
         }
+        state.update(self._qr_sync_state(state))
+        return state
 
     def set_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         restart_target = None
@@ -816,11 +1197,19 @@ class InstallationController:
                     self.cycle_pause_retract_sec = max(0.0, float(payload["cycle_pause_retract_sec"]))
                 if "cycle_random" in payload:
                     self.cycle_random = bool(payload["cycle_random"])
+                if "qr_sync_enabled" in payload:
+                    self.qr_sync_enabled = bool(payload["qr_sync_enabled"])
+                if "qr_sync_debug_enabled" in payload:
+                    self.qr_sync_debug_enabled = bool(payload["qr_sync_debug_enabled"])
+                if "qr_sync_guard_sec" in payload:
+                    self.qr_sync_guard_sec = clamp(float(payload["qr_sync_guard_sec"]), 0.0, 60.0)
                 if "sequence_id" in payload:
                     sequence_id = payload["sequence_id"] or None
                     if sequence_id is not None and not self.library.get(str(sequence_id)):
                         raise ValueError("Unknown sequence_id")
                     self.selected_sequence_id = str(sequence_id) if sequence_id is not None else None
+                    self.cycle_pending_sequence_id = None
+                    self.cycle_pending_direction = None
 
             if restart_target is not None and not self.is_switch_override_active() and not self.is_counting_down():
                 with self.hardware.lock:
@@ -912,7 +1301,20 @@ class InstallationController:
         if event:
             event.set()
 
-    def _set_cycle_pause(self, phase: str, deadline: float) -> None:
+    def _set_cycle_pause(
+        self,
+        phase: str,
+        deadline: float,
+        pending_sequence_id: str | None = None,
+        pending_direction: int | None = None,
+    ) -> None:
+        with self.state_lock:
+            self.cycle_pause_phase = phase
+            self.cycle_pause_deadline = deadline
+            self.cycle_pending_sequence_id = pending_sequence_id
+            self.cycle_pending_direction = pending_direction
+
+    def _update_cycle_pause_deadline(self, phase: str, deadline: float) -> None:
         with self.state_lock:
             self.cycle_pause_phase = phase
             self.cycle_pause_deadline = deadline
@@ -936,6 +1338,21 @@ class InstallationController:
                 return
             self.cycle_pause_phase = None
             self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
+
+    def _finish_cycle_pause_selection(self, fallback_sequence_id: str | None) -> None:
+        with self.state_lock:
+            pending_sequence_id = self.cycle_pending_sequence_id
+            self.cycle_pause_phase = None
+            self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
+
+        if pending_sequence_id is not None:
+            self._set_selected_sequence_id(pending_sequence_id, persist=False)
+        elif fallback_sequence_id is None:
+            self._set_selected_sequence_id(None, persist=False)
 
     def execute_movement(self) -> None:
         if self.is_switch_override_active():
@@ -1041,6 +1458,8 @@ class InstallationController:
             self.active_target = None
             self.cycle_pause_phase = None
             self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
             self.last_cycle_end_reason = reason
         self.hardware.stop_pwm()
 
@@ -1072,14 +1491,22 @@ class InstallationController:
                 self.cycle_thread = cycle_thread
             cycle_thread.start()
 
-    def _cycle_wait(self, seconds: float, phase: str, cycle_token: int) -> bool:
+    def _cycle_wait(
+        self,
+        seconds: float,
+        phase: str,
+        cycle_token: int,
+        pending_sequence_id: str | None = None,
+        pending_direction: int | None = None,
+    ) -> bool:
         if seconds <= 0:
             self._clear_cycle_pause()
             return True
 
         remaining = seconds
         last_tick = time.time()
-        self._set_cycle_pause(phase, last_tick + remaining)
+        completed = False
+        self._set_cycle_pause(phase, last_tick + remaining, pending_sequence_id, pending_direction)
         try:
             while True:
                 with self.state_lock:
@@ -1091,17 +1518,19 @@ class InstallationController:
                 now = time.time()
                 if is_cycle_paused:
                     last_tick = now
-                    self._set_cycle_pause(phase, now + remaining)
+                    self._update_cycle_pause_deadline(phase, now + remaining)
                     time.sleep(0.1)
                     continue
                 remaining -= max(0.0, now - last_tick)
                 last_tick = now
-                self._set_cycle_pause(phase, now + max(remaining, 0.0))
+                self._update_cycle_pause_deadline(phase, now + max(remaining, 0.0))
                 if remaining <= 0:
+                    completed = True
                     return True
                 time.sleep(min(0.1, remaining))
         finally:
-            self._clear_cycle_pause()
+            if not completed:
+                self._clear_cycle_pause()
 
     def _cycle_move_to_target(self, target_pct: float, duty: float, cycle_token: int) -> bool:
         while not self.shutdown_event.is_set():
@@ -1140,25 +1569,7 @@ class InstallationController:
         return False
 
     def _advance_sequence(self, step: int = 1, randomize: bool = False, persist: bool = True) -> None:
-        ordered = self.library.ordered_ids()
-        if not ordered:
-            with self.state_lock:
-                self.selected_sequence_id = None
-            return
-
-        with self.state_lock:
-            current = self.selected_sequence_id
-            if current not in ordered:
-                self.selected_sequence_id = ordered[0]
-            elif randomize and len(ordered) > 1:
-                choices = [sequence_id for sequence_id in ordered if sequence_id != current]
-                self.selected_sequence_id = random.choice(choices)
-            else:
-                index = ordered.index(current)
-                self.selected_sequence_id = ordered[(index + step) % len(ordered)]
-
-        if persist:
-            self._save_settings()
+        self._set_selected_sequence_id(self._pick_advanced_sequence_id(step=step, randomize=randomize), persist=persist)
 
     def previous_sequence(self) -> None:
         self._advance_sequence(step=-1)
@@ -1183,10 +1594,13 @@ class InstallationController:
                 with self.state_lock:
                     if cycle_token != self.cycle_token or not self.is_cycling:
                         break
-                if not self._cycle_wait(pause_extend, "top", cycle_token):
-                    break
-
-                self._advance_sequence(randomize=randomize, persist=False)
+                pending_down_sequence_id = self._pick_advanced_sequence_id(randomize=randomize)
+                if pause_extend <= 0:
+                    self._set_selected_sequence_id(pending_down_sequence_id, persist=False)
+                else:
+                    if not self._cycle_wait(pause_extend, "top", cycle_token, pending_down_sequence_id, -1):
+                        break
+                    self._finish_cycle_pause_selection(pending_down_sequence_id)
 
                 with self.state_lock:
                     if cycle_token != self.cycle_token or not self.is_cycling:
@@ -1196,10 +1610,13 @@ class InstallationController:
                 with self.state_lock:
                     if cycle_token != self.cycle_token or not self.is_cycling:
                         break
-                if not self._cycle_wait(pause_retract, "bottom", cycle_token):
-                    break
-
-                self._advance_sequence(randomize=randomize, persist=False)
+                pending_up_sequence_id = self._pick_advanced_sequence_id(randomize=randomize)
+                if pause_retract <= 0:
+                    self._set_selected_sequence_id(pending_up_sequence_id, persist=False)
+                else:
+                    if not self._cycle_wait(pause_retract, "bottom", cycle_token, pending_up_sequence_id, 1):
+                        break
+                    self._finish_cycle_pause_selection(pending_up_sequence_id)
         except Exception as exc:
             cycle_end_reason = f"error: {exc}"
             print(f"Cycle loop stopped due to error: {exc}")
@@ -1216,6 +1633,8 @@ class InstallationController:
                     self.active_target = None
                     self.cycle_pause_phase = None
                     self.cycle_pause_deadline = None
+                    self.cycle_pending_sequence_id = None
+                    self.cycle_pending_direction = None
             if is_current_cycle:
                 self.hardware.stop_pwm()
                 self._save_settings()
@@ -1231,6 +1650,8 @@ class InstallationController:
             self.active_target = None
             self.cycle_pause_phase = None
             self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
             self.last_cycle_end_reason = None
             self.last_runtime_error = None
         self.hardware.resume()
@@ -1250,6 +1671,8 @@ class InstallationController:
             self.active_target = None
             self.cycle_pause_phase = None
             self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
             self.last_cycle_end_reason = None
             self.last_runtime_error = None
         threading.Thread(target=self._home_worker, daemon=True).start()
@@ -1263,6 +1686,8 @@ class InstallationController:
             self.is_cycle_paused = False
             self.cycle_pause_phase = None
             self.cycle_pause_deadline = None
+            self.cycle_pending_sequence_id = None
+            self.cycle_pending_direction = None
             self.last_runtime_error = None
         with self.hardware.lock:
             self.hardware.is_paused = False
@@ -1401,6 +1826,13 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._send_json(self._controller_state(), head_only=head_only)
             return
+        if path == "/api/qr-sync.png":
+            controller = self._require_controller()
+            try:
+                self._serve_file(controller.get_qr_sync_image_path(), cache_control="no-store", head_only=head_only)
+            except Exception as exc:
+                self._json_error(HTTPStatus.NOT_FOUND, str(exc))
+            return
         if path == "/api/pi-camera/state":
             self._send_json({"pi_camera": self._pi_camera_state()}, head_only=head_only)
             return
@@ -1482,6 +1914,8 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.home()
             elif action == "cycle_toggle":
                 controller.toggle_cycle()
+            elif action == "qr_sync_toggle":
+                controller.toggle_qr_sync_display()
             elif action == "jog_start":
                 controller.start_jog(int(payload.get("direction", 0)))
             elif action == "jog_stop":
@@ -1804,7 +2238,11 @@ class MpvDisplayBackend:
             "--no-terminal",
             "--really-quiet",
             "--osc=no",
-            "--osd-level=0",
+            "--osd-level=1",
+            "--osd-align-x=right",
+            "--osd-align-y=center",
+            "--osd-margin-x=80",
+            "--osd-font-size=34",
             "--keep-open=yes",
             "--loop-file=no",
             f"--input-ipc-server={MPV_IPC_PATH}",
@@ -1868,15 +2306,7 @@ class MpvDisplayBackend:
             pass
 
     def _write_black_image(self) -> None:
-        if MPV_BLACK_IMAGE.exists():
-            return
-        # 1x1 black PNG.
-        MPV_BLACK_IMAGE.write_bytes(
-            bytes.fromhex(
-                "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
-                "0000000c4944415408d7636060000000050001a5f645400000000049454e44ae426082"
-            )
-        )
+        MPV_BLACK_IMAGE.write_bytes(solid_png_bytes(1920, 1080, (0, 0, 0)))
 
     def _connect(self) -> None:
         deadline = time.time() + 5.0
@@ -1962,14 +2392,45 @@ class MpvDisplayBackend:
         self.last_seek_at = now
 
     def _load_black(self) -> None:
+        self._clear_osd()
         key = ("black",)
         if self.loaded_key != key:
-            self._command(["loadfile", str(MPV_BLACK_IMAGE), "replace"])
+            response = self._command(["loadfile", str(MPV_BLACK_IMAGE), "replace"], timeout=0.5)
+            if not response or response.get("error") != "success":
+                self.loaded_key = None
+                error = response.get("error") if response else "no response"
+                self.controller.set_display_backend_status("mpv", f"MPV black load failed: {error}")
+                return
+            self.loaded_key = key
+            self.last_pause = None
+            self.last_speed = None
+            self.last_seek_at = 0.0
+        self._set_speed(1.0)
+        self._set_pause(True)
+
+    def _clear_osd(self) -> None:
+        self._command(["show-text", "", 1], timeout=0.1)
+
+    def _show_qr_debug_text(self, state: dict[str, Any]) -> None:
+        text = "\n".join(self.controller._qr_sync_debug_lines(state))
+        self._command(["show-text", text, 350], timeout=0.1)
+
+    def _load_qr_sync(self, state: dict[str, Any]) -> None:
+        qr_hash = state.get("qr_sync_hash") or "qr"
+        key = ("qr-sync", qr_hash)
+        if self.loaded_key != key:
+            image_path = self.controller.get_qr_sync_image_path(state)
+            response = self._command(["loadfile", str(image_path), "replace"], timeout=0.5)
+            if not response or response.get("error") != "success":
+                self._load_black()
+                return
             self.loaded_key = key
             self.last_pause = None
             self.last_speed = None
         self._set_speed(1.0)
         self._set_pause(True)
+        if Image is None and bool(state.get("qr_sync_debug_enabled", True)):
+            self._show_qr_debug_text(state)
 
     def _direction_for_state(self, state: dict[str, Any]) -> int:
         switch_direction = int(state.get("switch_direction") or 0)
@@ -2091,6 +2552,14 @@ class MpvDisplayBackend:
 
     def _sync_state(self) -> None:
         state = self.controller.get_state()
+        display_mode = state.get("qr_sync_display_mode")
+        if display_mode == "qr" or (display_mode is None and state.get("qr_sync_display_active")):
+            self._load_qr_sync(state)
+            return
+        if display_mode == "black" or (display_mode is None and state.get("qr_sync_standby_blackout")):
+            self._load_black()
+            return
+
         sequence = self.controller.library.get(state.get("selected_sequence_id"))
         if not sequence:
             self._load_black()

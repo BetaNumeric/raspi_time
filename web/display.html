@@ -46,6 +46,48 @@
             pointer-events: none;
         }
 
+        #qrStandbyImage {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+            padding: min(9vw, 9vh);
+            display: none;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        body.qr-active #qrStandbyImage {
+            right: auto;
+            width: 62vw;
+            padding: min(7vw, 8vh);
+        }
+
+        #qrDebugPanel {
+            position: absolute;
+            top: 50%;
+            right: min(5vw, 72px);
+            z-index: 3;
+            display: none;
+            width: min(32vw, 520px);
+            transform: translateY(-50%);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: rgba(0, 0, 0, 0.72);
+            padding: 22px 24px;
+            white-space: pre-line;
+            font-size: clamp(1rem, 1.6vw, 1.55rem);
+            line-height: 1.35;
+            font-weight: 800;
+            pointer-events: none;
+        }
+
+        body.qr-active #qrDebugPanel {
+            display: block;
+        }
+
         .hud {
             position: absolute;
             left: 20px;
@@ -133,6 +175,8 @@
 </head>
 <body class="clean">
     <canvas id="displayCanvas"></canvas>
+    <img id="qrStandbyImage" alt="Camera sync QR" draggable="false">
+    <div id="qrDebugPanel" aria-live="polite"></div>
     <video id="hiddenVideo" muted playsinline preload="auto"></video>
 
     <div class="hud hud-top">
@@ -164,6 +208,8 @@
 
         const canvas = document.getElementById("displayCanvas");
         const ctx = canvas.getContext("2d", { alpha: false });
+        const qrStandbyImage = document.getElementById("qrStandbyImage");
+        const qrDebugPanel = document.getElementById("qrDebugPanel");
         const hiddenVideo = document.getElementById("hiddenVideo");
         const sequenceName = document.getElementById("sequenceName");
         const modeLabel = document.getElementById("modeLabel");
@@ -186,6 +232,7 @@
         let renderLoopId = null;
         let lastPreloadCenterIndex = null;
         let lastPreloadDirection = 0;
+        let lastQrSyncHash = null;
 
         const IMAGE_PRELOAD_IDLE_RADIUS = 10;
         const IMAGE_PRELOAD_BEHIND = 8;
@@ -621,9 +668,79 @@
             }
         }
 
+        function syncQrStandbyImage(state) {
+            const active = Boolean(state && (state.qr_sync_display_mode === "qr" || state.qr_sync_display_active) && state.qr_sync_hash);
+            qrStandbyImage.style.display = active ? "block" : "none";
+            document.body.classList.toggle("qr-active", active);
+            if (!active) {
+                lastQrSyncHash = null;
+                qrStandbyImage.removeAttribute("src");
+                qrDebugPanel.textContent = "";
+                return false;
+            }
+
+            if (state.qr_sync_hash !== lastQrSyncHash) {
+                lastQrSyncHash = state.qr_sync_hash;
+                qrStandbyImage.src = `/api/qr-sync.png?h=${encodeURIComponent(state.qr_sync_hash)}`;
+            }
+            qrDebugPanel.textContent = qrDebugText(state);
+            return true;
+        }
+
+        function formatQrSeconds(ms) {
+            if (ms == null || !Number.isFinite(Number(ms))) return "--";
+            const seconds = Math.max(0, Number(ms) / 1000);
+            return seconds >= 10 ? `${Math.round(seconds)}s` : `${seconds.toFixed(1)}s`;
+        }
+
+        function qrDirectionLabel(direction) {
+            const value = Number(direction || 0);
+            if (value > 0) return "Up";
+            if (value < 0) return "Down";
+            return "Idle";
+        }
+
+        function qrDebugText(state) {
+            const payload = state.qr_sync_payload || {};
+            const name = payload.n || state.qr_sync_label || "Camera QR";
+            const lines = [
+                `QR Sync`,
+                `Next: ${name}`,
+                `Starts in: ${formatQrSeconds(payload.si)}`,
+                `Capture: ${formatQrSeconds(payload.du)}`,
+                `Direction: ${qrDirectionLabel(payload.d)}`,
+                `Phase: ${payload.ph || "idle"}`
+            ];
+            if (payload.fr) lines.push(`Frames: ${payload.fr}`);
+            lines.push(`Blackout: ${formatQrSeconds((state.qr_sync_guard_sec || 0) * 1000)}`);
+            return lines.join("\n");
+        }
+
+        function qrSyncBlocksFrameDisplay(state) {
+            return Boolean(state && (
+                state.qr_sync_display_mode === "black" ||
+                state.qr_sync_display_mode === "qr" ||
+                state.qr_sync_standby_blackout ||
+                state.qr_sync_display_active
+            ));
+        }
+
         function drawCurrentFrame() {
             const displayPositionPct = estimatedPositionPct();
             updateOverlays(displayPositionPct);
+
+            if (syncQrStandbyImage(currentState)) {
+                clearCanvas();
+                frameLabel.textContent = "Camera QR";
+                return;
+            }
+
+            if (currentState && (currentState.qr_sync_display_mode === "black" || currentState.qr_sync_standby_blackout)) {
+                document.body.classList.remove("qr-active");
+                clearCanvas();
+                frameLabel.textContent = currentState.qr_sync_blackout_reason === "before_start" ? "QR hidden" : "Standby";
+                return;
+            }
 
             if (!currentState || !currentSequence) {
                 clearCanvas();
@@ -661,7 +778,7 @@
                 }
 
                 requestImage(imageUrl, (image) => {
-                    if (!currentState || !currentSequence) {
+                    if (!currentState || !currentSequence || qrSyncBlocksFrameDisplay(currentState)) {
                         return;
                     }
                     const latestDirection = movementDirectionForState(currentState, estimatedPositionPct());
@@ -741,6 +858,9 @@
         hiddenVideo.addEventListener("loadedmetadata", drawCurrentFrame);
         hiddenVideo.addEventListener("seeked", () => {
             if (!currentState || !currentSequence || currentSequence.kind !== "video") {
+                return;
+            }
+            if (qrSyncBlocksFrameDisplay(currentState)) {
                 return;
             }
             if (playbackRatioForPosition(currentSequence, estimatedPositionPct()) == null) {
