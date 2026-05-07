@@ -612,6 +612,7 @@ class InstallationController:
         self.cycle_pause_extend_sec = 2.0
         self.cycle_pause_retract_sec = 2.0
         self.cycle_random = False
+        self.cycle_order_ids: list[str] = []
         self.selected_sequence_id: str | None = None
         self.is_cycling = False
         self.is_cycle_paused = False
@@ -622,6 +623,7 @@ class InstallationController:
 
         self.countdown_deadline: float | None = None
         self.countdown_event: threading.Event | None = None
+        self.countdown_action = "movement"
         self.cycle_pause_phase: str | None = None
         self.cycle_pause_deadline: float | None = None
         self.cycle_pending_sequence_id: str | None = None
@@ -647,6 +649,7 @@ class InstallationController:
 
         self._load_settings()
         self._ensure_valid_selection()
+        self._ensure_cycle_order()
         self.hardware.current_duty = self.speed_duty
 
         self.switch_thread = threading.Thread(target=self._poll_toggle_switch_loop, daemon=True)
@@ -666,6 +669,9 @@ class InstallationController:
         self.cycle_pause_extend_sec = max(0.0, float(data.get("cycle_pause_extend_sec", self.cycle_pause_extend_sec)))
         self.cycle_pause_retract_sec = max(0.0, float(data.get("cycle_pause_retract_sec", self.cycle_pause_retract_sec)))
         self.cycle_random = bool(data.get("cycle_random", self.cycle_random))
+        cycle_order_ids = data.get("cycle_order_ids")
+        if isinstance(cycle_order_ids, list):
+            self.cycle_order_ids = [str(item) for item in cycle_order_ids if isinstance(item, str) and item]
         self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
         self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
         qr_settings_version = int(coerce_float(data.get("qr_sync_settings_version"), 0))
@@ -682,6 +688,7 @@ class InstallationController:
 
     def _save_settings(self) -> None:
         with self.state_lock:
+            cycle_order_ids = list(self.cycle_order_ids)
             payload = {
                 "target_pct": round(self.target_pct, 2),
                 "delay_sec": self.delay_sec,
@@ -689,12 +696,14 @@ class InstallationController:
                 "cycle_pause_extend_sec": round(self.cycle_pause_extend_sec, 2),
                 "cycle_pause_retract_sec": round(self.cycle_pause_retract_sec, 2),
                 "cycle_random": self.cycle_random,
+                "cycle_order_ids": [],
                 "selected_sequence_id": self.selected_sequence_id,
                 "qr_sync_enabled": self.qr_sync_enabled,
                 "qr_sync_debug_enabled": self.qr_sync_debug_enabled,
                 "qr_sync_guard_sec": round(self.qr_sync_guard_sec, 2),
                 "qr_sync_settings_version": QR_SYNC_SETTINGS_VERSION,
             }
+        payload["cycle_order_ids"] = self._normalize_cycle_order_ids(cycle_order_ids)
         temp_path = STATE_FILE.with_suffix(".tmp")
         body = json.dumps(payload, indent=2)
         with self.settings_io_lock:
@@ -743,6 +752,30 @@ class InstallationController:
                 return
             self.selected_sequence_id = ordered[0] if ordered else None
 
+    def _normalize_cycle_order_ids(self, configured_ids: list[str] | None = None) -> list[str]:
+        library_order = self.library.ordered_ids()
+        if configured_ids is None:
+            with self.state_lock:
+                configured_ids = list(self.cycle_order_ids)
+
+        valid_ids = set(library_order)
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for sequence_id in configured_ids:
+            if sequence_id in valid_ids and sequence_id not in seen:
+                normalized.append(sequence_id)
+                seen.add(sequence_id)
+        for sequence_id in library_order:
+            if sequence_id not in seen:
+                normalized.append(sequence_id)
+        return normalized
+
+    def _ensure_cycle_order(self) -> list[str]:
+        normalized = self._normalize_cycle_order_ids()
+        with self.state_lock:
+            self.cycle_order_ids = normalized
+        return normalized
+
     def get_library(self) -> list[dict[str, Any]]:
         return self.library.list_summaries()
 
@@ -753,6 +786,7 @@ class InstallationController:
     def refresh_library(self) -> list[dict[str, Any]]:
         items = self.library.scan()
         self._ensure_valid_selection()
+        self._ensure_cycle_order()
         self._save_settings()
         return items
 
@@ -796,7 +830,7 @@ class InstallationController:
             self.qr_sync_enabled = not self.qr_sync_enabled
 
     def _pick_advanced_sequence_id(self, step: int = 1, randomize: bool = False) -> str | None:
-        ordered = self.library.ordered_ids()
+        ordered = self._normalize_cycle_order_ids()
         if not ordered:
             return None
 
@@ -887,6 +921,8 @@ class InstallationController:
                 return "before_start"
 
         if state.get("countdown_deadline_ms") is None:
+            if state.get("cycle_pause_deadline_ms") is not None:
+                return None
             last_motion_end_ms = state.get("qr_sync_last_motion_end_ms")
             if guard_ms > 0 and isinstance(last_motion_end_ms, int):
                 elapsed_ms = int(state.get("server_time_ms") or 0) - last_motion_end_ms
@@ -1080,6 +1116,7 @@ class InstallationController:
 
         with self.state_lock:
             countdown_deadline = self.countdown_deadline
+            countdown_action = self.countdown_action
             selected_sequence_id = self.selected_sequence_id
             target_pct = round(self.target_pct, 2)
             speed_duty = round(self.speed_duty, 3)
@@ -1102,6 +1139,7 @@ class InstallationController:
             qr_sync_guard_sec = round(self.qr_sync_guard_sec, 2)
             display_backend_mode = self.display_backend_mode
             display_backend_status = self.display_backend_status
+            cycle_order_ids = list(self.cycle_order_ids)
 
         now = time.time()
         with self.state_lock:
@@ -1126,10 +1164,16 @@ class InstallationController:
             cycle_pause_remaining_ms = max(0, int((cycle_pause_deadline - now) * 1000))
 
         sequence = self.library.get(selected_sequence_id)
+        cycle_order_ids = self._normalize_cycle_order_ids(cycle_order_ids)
+        cycle_next_sequence_id = cycle_pending_sequence_id
+        if cycle_next_sequence_id is None and not cycle_random and selected_sequence_id in cycle_order_ids:
+            cycle_next_sequence_id = cycle_order_ids[(cycle_order_ids.index(selected_sequence_id) + 1) % len(cycle_order_ids)]
+        cycle_next_sequence = self.library.get(cycle_next_sequence_id)
         state = {
             "server_time_ms": int(now * 1000),
             "countdown_deadline_ms": deadline_ms,
             "countdown_remaining": countdown_remaining,
+            "countdown_action": countdown_action,
             "cycle_pause_phase": cycle_pause_phase,
             "cycle_pause_deadline_ms": cycle_pause_deadline_ms,
             "cycle_pause_remaining_ms": cycle_pause_remaining_ms,
@@ -1143,6 +1187,9 @@ class InstallationController:
             "cycle_pause_extend_sec": cycle_pause_extend_sec,
             "cycle_pause_retract_sec": cycle_pause_retract_sec,
             "cycle_random": cycle_random,
+            "cycle_order_ids": cycle_order_ids,
+            "cycle_next_sequence_id": cycle_next_sequence_id,
+            "cycle_next_sequence_name": cycle_next_sequence.name if cycle_next_sequence else None,
             "is_moving": is_moving,
             "is_paused": is_paused,
             "is_cycling": is_cycling,
@@ -1197,6 +1244,12 @@ class InstallationController:
                     self.cycle_pause_retract_sec = max(0.0, float(payload["cycle_pause_retract_sec"]))
                 if "cycle_random" in payload:
                     self.cycle_random = bool(payload["cycle_random"])
+                if "cycle_order_ids" in payload:
+                    raw_order = payload["cycle_order_ids"]
+                    if not isinstance(raw_order, list):
+                        raise ValueError("cycle_order_ids must be a list")
+                    requested_order = [str(item) for item in raw_order if isinstance(item, str) and item]
+                    self.cycle_order_ids = self._normalize_cycle_order_ids(requested_order)
                 if "qr_sync_enabled" in payload:
                     self.qr_sync_enabled = bool(payload["qr_sync_enabled"])
                 if "qr_sync_debug_enabled" in payload:
@@ -1260,16 +1313,20 @@ class InstallationController:
         with self.state_lock:
             return self.countdown_deadline is not None
 
-    def start_countdown(self, seconds: int) -> None:
+    def start_countdown(self, seconds: int, action: str = "movement") -> None:
         self.cancel_countdown()
         if seconds <= 0:
-            self.execute_movement()
+            if action == "cycle":
+                self._start_cycle_from_countdown()
+            else:
+                self.execute_movement()
             return
         event = threading.Event()
         deadline = time.time() + seconds
         with self.state_lock:
             self.countdown_deadline = deadline
             self.countdown_event = event
+            self.countdown_action = action if action in {"movement", "cycle"} else "movement"
         threading.Thread(target=self._countdown_worker, args=(event,), daemon=True).start()
 
     def _countdown_worker(self, event: threading.Event) -> None:
@@ -1288,16 +1345,24 @@ class InstallationController:
 
         with self.state_lock:
             if self.countdown_event is event:
+                action = self.countdown_action
                 self.countdown_event = None
                 self.countdown_deadline = None
+                self.countdown_action = "movement"
+            else:
+                action = "movement"
 
-        self.execute_movement()
+        if action == "cycle":
+            self._start_cycle_from_countdown()
+        else:
+            self.execute_movement()
 
     def cancel_countdown(self) -> None:
         with self.state_lock:
             event = self.countdown_event
             self.countdown_event = None
             self.countdown_deadline = None
+            self.countdown_action = "movement"
         if event:
             event.set()
 
@@ -1463,33 +1528,61 @@ class InstallationController:
             self.last_cycle_end_reason = reason
         self.hardware.stop_pwm()
 
+    def _start_cycle_now_locked(self) -> None:
+        if self.is_switch_override_active():
+            return
+        with self.hardware.lock:
+            if self.hardware.is_moving:
+                return
+
+        if not self._wait_for_cycle_thread():
+            with self.state_lock:
+                self.last_cycle_end_reason = "previous cycle still stopping"
+            return
+        self._clear_cycle_pause()
+        with self.state_lock:
+            self.cycle_token += 1
+            cycle_token = self.cycle_token
+            self.is_cycling = True
+            self.is_cycle_paused = False
+            self.last_cycle_end_reason = None
+            self.last_runtime_error = None
+            cycle_thread = threading.Thread(target=self._cycle_loop, args=(cycle_token,), daemon=True)
+            self.cycle_thread = cycle_thread
+        cycle_thread.start()
+
+    def _start_cycle_from_countdown(self) -> None:
+        with self.command_lock:
+            with self.state_lock:
+                if self.is_cycling:
+                    return
+            self._start_cycle_now_locked()
+
     def toggle_cycle(self) -> None:
         with self.command_lock:
-            if self.is_cycling:
+            with self.state_lock:
+                is_cycling = self.is_cycling
+                is_counting_down = self.countdown_deadline is not None
+                countdown_action = self.countdown_action
+                delay = self.delay_sec
+            if is_cycling:
                 self.stop_cycle("stopped")
                 return
+            if is_counting_down:
+                if countdown_action == "cycle":
+                    self.cancel_countdown()
+                    return
+                self.cancel_countdown()
             if self.is_switch_override_active():
                 return
             with self.hardware.lock:
                 if self.hardware.is_moving:
                     return
 
-            if not self._wait_for_cycle_thread():
-                with self.state_lock:
-                    self.last_cycle_end_reason = "previous cycle still stopping"
+            if delay > 0:
+                self.start_countdown(delay, action="cycle")
                 return
-            self.cancel_countdown()
-            self._clear_cycle_pause()
-            with self.state_lock:
-                self.cycle_token += 1
-                cycle_token = self.cycle_token
-                self.is_cycling = True
-                self.is_cycle_paused = False
-                self.last_cycle_end_reason = None
-                self.last_runtime_error = None
-                cycle_thread = threading.Thread(target=self._cycle_loop, args=(cycle_token,), daemon=True)
-                self.cycle_thread = cycle_thread
-            cycle_thread.start()
+            self._start_cycle_now_locked()
 
     def _cycle_wait(
         self,

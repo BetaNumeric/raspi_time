@@ -577,6 +577,172 @@
             min-height: 50px;
         }
 
+        .cycle-panel {
+            border-color: rgba(242, 182, 97, 0.16);
+        }
+
+        .cycle-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .cycle-title {
+            margin: 0;
+            font-size: 1.28rem;
+            line-height: 1.1;
+            font-weight: 800;
+            letter-spacing: 0;
+        }
+
+        .cycle-toolbar {
+            display: grid;
+            grid-template-columns: minmax(150px, 1fr) minmax(140px, 1fr);
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .cycle-toolbar button {
+            min-height: 56px;
+            font-weight: 800;
+        }
+
+        .cycle-overview {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .cycle-overview-item {
+            min-width: 0;
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .cycle-overview-label {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 10px;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .cycle-overview-value {
+            display: block;
+            font-weight: 800;
+            line-height: 1.2;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cycle-timeline-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin: 14px 0 8px;
+        }
+
+        .cycle-timeline-header .eyebrow {
+            margin: 0;
+        }
+
+        .cycle-reset {
+            min-height: 38px;
+            padding: 8px 10px;
+            font-size: 0.84rem;
+        }
+
+        .cycle-timeline {
+            display: grid;
+            gap: 8px;
+        }
+
+        .cycle-step {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 10px;
+            align-items: center;
+            min-width: 0;
+            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .cycle-step.is-active {
+            border-color: rgba(242, 182, 97, 0.34);
+            background: rgba(242, 182, 97, 0.09);
+        }
+
+        .cycle-step.is-pending {
+            border-color: rgba(255, 255, 255, 0.18);
+        }
+
+        .cycle-step-index {
+            width: 34px;
+            height: 34px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+            font-weight: 800;
+            font-size: 0.86rem;
+        }
+
+        .cycle-step-main {
+            min-width: 0;
+            width: 100%;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            text-align: left;
+            display: block;
+        }
+
+        .cycle-step-name {
+            display: block;
+            font-weight: 800;
+            line-height: 1.18;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cycle-step-meta {
+            display: block;
+            margin-top: 3px;
+            color: var(--muted);
+            font-size: 0.82rem;
+            line-height: 1.25;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cycle-step-actions {
+            display: inline-flex;
+            gap: 6px;
+        }
+
+        .cycle-step-actions button {
+            min-width: 40px;
+            min-height: 40px;
+            padding: 0 10px;
+            font-size: 0.82rem;
+            font-weight: 800;
+        }
+
         .pause-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -767,10 +933,23 @@
         }
 
         @media (max-width: 720px) {
-            .settings-grid, .sequence-grid, .pi-camera-settings, .pi-camera-options, .pi-camera-actions { grid-template-columns: 1fr; }
+            .settings-grid, .sequence-grid, .cycle-toolbar, .cycle-overview, .pi-camera-settings, .pi-camera-options, .pi-camera-actions { grid-template-columns: 1fr; }
             .field-row { display: grid; }
             .sequence-meta {
                 align-items: stretch;
+            }
+            .cycle-header {
+                display: grid;
+            }
+            .cycle-step {
+                grid-template-columns: auto minmax(0, 1fr);
+            }
+            .cycle-step-actions {
+                grid-column: 1 / -1;
+                justify-content: stretch;
+            }
+            .cycle-step-actions button {
+                flex: 1 1 0;
             }
             .advanced-actions, .advanced-links {
                 grid-template-columns: 1fr;
@@ -945,20 +1124,69 @@
             </div>
         </details>
 
-        <details class="panel" id="previewDetails">
-            <summary>Preview</summary>
-            <div class="details-body">
-                <div class="preview-stage">
-                    <img id="previewImage" alt="Sequence preview" draggable="false">
-                    <video id="previewVideo" muted playsinline preload="metadata"></video>
-                    <div id="previewEmpty" class="preview-empty">Select a sequence.</div>
+        <section class="panel cycle-panel">
+            <div class="cycle-header">
+                <div>
+                    <h2 class="cycle-title">Automatic Cycle</h2>
                 </div>
-                <div class="preview-meta" id="previewMeta">No sequence</div>
+                <button id="cycleBtn" type="button" class="primary">Start Cycle</button>
             </div>
-        </details>
-
-        <section class="panel">
-            <div class="eyebrow">Sequence</div>
+            <div class="cycle-overview" aria-live="polite">
+                <div class="cycle-overview-item">
+                    <span class="cycle-overview-label">Phase</span>
+                    <span id="cyclePhaseValue" class="cycle-overview-value">Ready</span>
+                </div>
+                <div class="cycle-overview-item">
+                    <span class="cycle-overview-label">Current</span>
+                    <span id="cycleCurrentValue" class="cycle-overview-value">-</span>
+                </div>
+                <div class="cycle-overview-item">
+                    <span class="cycle-overview-label">Next</span>
+                    <span id="cycleNextValue" class="cycle-overview-value">-</span>
+                </div>
+                <div class="cycle-overview-item">
+                    <span class="cycle-overview-label">Order</span>
+                    <span id="cycleOrderValue" class="cycle-overview-value">-</span>
+                </div>
+            </div>
+            <div class="cycle-toolbar">
+                <div class="field">
+                    <label for="cycleRandom">Selection</label>
+                    <select id="cycleRandom" class="order-select">
+                        <option value="false">Timeline order</option>
+                        <option value="true">Randomize timeline</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="qrSyncEnabledInput">QR Display</label>
+                    <label class="checkbox-field" for="qrSyncEnabledInput">
+                        <input id="qrSyncEnabledInput" type="checkbox" checked>
+                        <span>Show QR when idle</span>
+                    </label>
+                </div>
+            </div>
+            <div class="pause-grid">
+                <div class="field">
+                    <label for="pauseExtendInput">Top Pause</label>
+                    <div class="unit-input">
+                        <input id="pauseExtendInput" type="number" min="0" max="600" step="0.5" value="20" inputmode="decimal">
+                        <span class="field-unit" aria-hidden="true">s</span>
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="pauseRetractInput">Bottom Pause</label>
+                    <div class="unit-input">
+                        <input id="pauseRetractInput" type="number" min="0" max="600" step="0.5" value="20" inputmode="decimal">
+                        <span class="field-unit" aria-hidden="true">s</span>
+                    </div>
+                </div>
+            </div>
+            <div class="cycle-timeline-header">
+                <div class="eyebrow">Timeline</div>
+                <button id="resetCycleOrderBtn" type="button" class="secondary cycle-reset">Library Order</button>
+            </div>
+            <div id="cycleTimeline" class="cycle-timeline"></div>
+            <div class="eyebrow" style="margin-top: 14px;">Sequence</div>
             <div class="sequence-actions">
                 <button id="prevSequenceBtn" type="button" class="icon-button" aria-label="Previous sequence" title="Previous sequence">
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1000,36 +1228,6 @@
                     <span id="sequenceStrideValue" class="sequence-readout-value">-</span>
                 </div>
             </div>
-            <div class="sequence-grid">
-                
-                <div class="field">
-                    <label for="cycleBtn">Cycle</label>
-                    <button id="cycleBtn" type="button" class="secondary">Start Cycle</button>
-                </div>
-                <div class="field">
-                    <label for="cycleRandom">Order</label>
-                    <select id="cycleRandom" class="order-select">
-                        <option value="false">Next in order</option>
-                        <option value="true">Randomize</option>
-                    </select>
-                </div>
-            </div>
-            <div class="pause-grid">
-                <div class="field">
-                    <label for="pauseExtendInput">Top Pause</label>
-                    <div class="unit-input">
-                        <input id="pauseExtendInput" type="number" min="0" max="600" step="0.5" value="2" inputmode="decimal">
-                        <span class="field-unit" aria-hidden="true">s</span>
-                    </div>
-                </div>
-                <div class="field">
-                    <label for="pauseRetractInput">Bottom Pause</label>
-                    <div class="unit-input">
-                        <input id="pauseRetractInput" type="number" min="0" max="600" step="0.5" value="2" inputmode="decimal">
-                        <span class="field-unit" aria-hidden="true">s</span>
-                    </div>
-                </div>
-            </div>
             <div class="sequence-meta">
                 <p class="footer-note" id="mediaRootNote"></p>
                 <button id="refreshLibraryBtn" type="button" class="icon-button" aria-label="Refresh library" title="Refresh library">
@@ -1041,6 +1239,18 @@
                 </button>
             </div>
         </section>
+
+        <details class="panel" id="previewDetails">
+            <summary>Preview</summary>
+            <div class="details-body">
+                <div class="preview-stage">
+                    <img id="previewImage" alt="Sequence preview" draggable="false">
+                    <video id="previewVideo" muted playsinline preload="metadata"></video>
+                    <div id="previewEmpty" class="preview-empty">Select a sequence.</div>
+                </div>
+                <div class="preview-meta" id="previewMeta">No sequence</div>
+            </div>
+        </details>
 
         <details class="panel">
             <summary>Advanced</summary>
@@ -1057,10 +1267,6 @@
                         <label for="speedRange">Speed</label>
                         <input id="speedRange" type="range" min="0.1" max="1" step="0.05" value="1">
                         <div class="hint" id="speedValue">100%</div>
-                    </div>
-                    <div class="field">
-                        <label for="qrSyncEnabledInput">Show QR</label>
-                        <input id="qrSyncEnabledInput" type="checkbox" checked>
                     </div>
                     <div class="field">
                         <label for="qrSyncDebugInput">QR Info Text</label>
@@ -1130,6 +1336,12 @@
         const qrSyncGuardRange = $("#qrSyncGuardRange");
         const qrSyncGuardValue = $("#qrSyncGuardValue");
         const cycleRandom = $("#cycleRandom");
+        const cyclePhaseValue = $("#cyclePhaseValue");
+        const cycleCurrentValue = $("#cycleCurrentValue");
+        const cycleNextValue = $("#cycleNextValue");
+        const cycleOrderValue = $("#cycleOrderValue");
+        const cycleTimeline = $("#cycleTimeline");
+        const resetCycleOrderBtn = $("#resetCycleOrderBtn");
         const pauseExtendInput = $("#pauseExtendInput");
         const pauseRetractInput = $("#pauseRetractInput");
         const sequenceSelect = $("#sequenceSelect");
@@ -1615,6 +1827,95 @@
             return `${formatCm(heightCm)} (${formatCm(startCm)}-${formatCm(endCm)})`;
         }
 
+        function escapeHtml(value) {
+            return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;",
+                '"': "&quot;",
+                "'": "&#39;"
+            }[char]));
+        }
+
+        function libraryItemById(sequenceId) {
+            return libraryItems.find((item) => item.id === sequenceId) || null;
+        }
+
+        function cycleOrderIdsFromState(state = currentState) {
+            const libraryIds = libraryItems.map((item) => item.id);
+            const validIds = new Set(libraryIds);
+            const configured = Array.isArray(state?.cycle_order_ids) ? state.cycle_order_ids : [];
+            const ordered = [];
+            const seen = new Set();
+            for (const sequenceId of configured) {
+                if (validIds.has(sequenceId) && !seen.has(sequenceId)) {
+                    ordered.push(sequenceId);
+                    seen.add(sequenceId);
+                }
+            }
+            for (const sequenceId of libraryIds) {
+                if (!seen.has(sequenceId)) ordered.push(sequenceId);
+            }
+            return ordered;
+        }
+
+        function sequenceNameForId(sequenceId, fallback = "-") {
+            if (!sequenceId) return fallback;
+            const item = libraryItemById(sequenceId);
+            return item ? item.name : sequenceId;
+        }
+
+        function describeTimelineItem(item) {
+            if (!item) return "Missing sequence";
+            const kind = item.kind === "images" ? `${item.frame_count || 0} frames` : "video";
+            return `${kind} | ${formatSequenceSpan(item)}`;
+        }
+
+        function renderCyclePanel(state) {
+            const orderIds = cycleOrderIdsFromState(state);
+            const pendingId = state.cycle_pending_sequence_id || null;
+            const nextLabel = state.cycle_random && !pendingId
+                ? "Random"
+                : sequenceNameForId(state.cycle_next_sequence_id || pendingId, "-");
+
+            cyclePhaseValue.textContent = getRunStatus(state).text;
+            cycleCurrentValue.textContent = sequenceNameForId(state.selected_sequence_id, "-");
+            cycleNextValue.textContent = nextLabel;
+            cycleOrderValue.textContent = state.cycle_random ? `${orderIds.length} random` : `${orderIds.length} ordered`;
+
+            if (!orderIds.length) {
+                cycleTimeline.innerHTML = `<div class="preview-empty" style="position: static; min-height: 90px;">No media sequences found.</div>`;
+                return;
+            }
+
+            cycleTimeline.innerHTML = orderIds.map((sequenceId, index) => {
+                const item = libraryItemById(sequenceId);
+                const isActive = sequenceId === state.selected_sequence_id;
+                const isPending = sequenceId === pendingId;
+                const classes = [
+                    "cycle-step",
+                    isActive ? "is-active" : "",
+                    isPending ? "is-pending" : ""
+                ].filter(Boolean).join(" ");
+                const tag = isPending
+                    ? "Next"
+                    : (isActive ? "Current" : describeTimelineItem(item));
+                return `
+                    <div class="${classes}" data-sequence-id="${escapeHtml(sequenceId)}">
+                        <span class="cycle-step-index">${index + 1}</span>
+                        <button type="button" class="cycle-step-main secondary" data-cycle-action="select" data-sequence-id="${escapeHtml(sequenceId)}">
+                            <span class="cycle-step-name">${escapeHtml(item?.name || sequenceId)}</span>
+                            <span class="cycle-step-meta">${escapeHtml(tag)}</span>
+                        </button>
+                        <div class="cycle-step-actions">
+                            <button type="button" class="secondary" data-cycle-action="up" data-sequence-id="${escapeHtml(sequenceId)}" ${index === 0 ? "disabled" : ""}>Up</button>
+                            <button type="button" class="secondary" data-cycle-action="down" data-sequence-id="${escapeHtml(sequenceId)}" ${index === orderIds.length - 1 ? "disabled" : ""}>Down</button>
+                        </div>
+                    </div>
+                `;
+            }).join("");
+        }
+
         function sequenceForState(state) {
             if (!state || !state.selected_sequence_id) return null;
             if (currentSequence && currentSequence.id === state.selected_sequence_id) {
@@ -1820,8 +2121,9 @@
 
             if (state.countdown_deadline_ms) {
                 const seconds = Math.max(0, (state.countdown_deadline_ms - state.server_time_ms) / 1000);
+                const label = state.countdown_action === "cycle" ? "Cycle start" : "Start delay";
                 return {
-                    text: `Start delay ${formatTimer(seconds)}`,
+                    text: `${label} ${formatTimer(seconds)}`,
                     tone: "active"
                 };
             }
@@ -1895,7 +2197,7 @@
             displayBackendValue.title = state.display_backend_status || "";
             modePill.textContent = motionLabel(state);
             countdownPill.textContent = state.countdown_deadline_ms
-                ? `Start ${formatTimer(state.countdown_remaining)}`
+                ? `${state.countdown_action === "cycle" ? "Cycle" : "Start"} ${formatTimer(state.countdown_remaining)}`
                 : (state.is_cycling && state.is_cycle_paused
                     ? "Paused"
                     : (cyclePause
@@ -1908,6 +2210,7 @@
             if (state.camera_url) {
                 cameraLink.href = state.camera_url;
             }
+            renderCyclePanel(state);
             renderSequenceReadout(state);
             renderPiCamera(state);
             if (targetRange.disabled !== state.is_cycling) {
@@ -1930,7 +2233,9 @@
                             ? "pause"
                             : "play"))
             );
-            cycleBtn.textContent = state.is_cycling ? "Stop Cycle" : "Start Cycle";
+            cycleBtn.textContent = state.is_cycling
+                ? "Stop Cycle"
+                : (state.countdown_deadline_ms && state.countdown_action === "cycle" ? "Cancel Delay" : "Start Cycle");
         }
 
         function populateLibrary(selectedId) {
@@ -2189,6 +2494,36 @@
             holdFormSync();
             await pushSettings({ sequence_id: sequenceSelect.value || null });
             await loadSequence(sequenceSelect.value || null);
+        });
+
+        cycleTimeline.addEventListener("click", async (event) => {
+            const button = event.target.closest("button[data-cycle-action]");
+            if (!button || button.disabled) return;
+            const sequenceId = button.dataset.sequenceId;
+            const action = button.dataset.cycleAction;
+            if (!sequenceId) return;
+
+            if (action === "select") {
+                holdFormSync();
+                await pushSettings({ sequence_id: sequenceId });
+                await loadSequence(sequenceId);
+                return;
+            }
+
+            const orderIds = cycleOrderIdsFromState();
+            const index = orderIds.indexOf(sequenceId);
+            const delta = action === "up" ? -1 : (action === "down" ? 1 : 0);
+            const nextIndex = index + delta;
+            if (index < 0 || nextIndex < 0 || nextIndex >= orderIds.length) return;
+            const nextOrder = [...orderIds];
+            [nextOrder[index], nextOrder[nextIndex]] = [nextOrder[nextIndex], nextOrder[index]];
+            holdFormSync();
+            await pushSettings({ cycle_order_ids: nextOrder });
+        });
+
+        resetCycleOrderBtn.addEventListener("click", async () => {
+            holdFormSync();
+            await pushSettings({ cycle_order_ids: libraryItems.map((item) => item.id) });
         });
 
         document.addEventListener("contextmenu", (event) => {
