@@ -450,7 +450,8 @@
 
         .preview-meta { margin-top: 10px; color: var(--muted); }
         .field { display: grid; gap: 8px; }
-        .field label { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
+        .field label,
+        .field-label { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
         .range-label {
             display: flex;
             justify-content: space-between;
@@ -599,7 +600,7 @@
 
         .cycle-toolbar {
             display: grid;
-            grid-template-columns: minmax(150px, 1fr) minmax(140px, 1fr);
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 12px;
             margin-bottom: 12px;
         }
@@ -612,15 +613,15 @@
         .cycle-overview {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 10px;
+            gap: 6px;
             margin-bottom: 12px;
         }
 
         .cycle-overview-item {
             min-width: 0;
-            padding: 10px 12px;
+            padding: 7px 8px;
             border: 1px solid var(--line);
-            border-radius: 16px;
+            border-radius: 12px;
             background: rgba(255, 255, 255, 0.03);
         }
 
@@ -642,12 +643,54 @@
             text-overflow: ellipsis;
         }
 
+        .cycle-fold {
+            margin-top: 12px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+            overflow: hidden;
+        }
+
+        .cycle-fold summary {
+            min-height: 46px;
+            padding: 0 12px;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            font-weight: 800;
+            list-style: none;
+        }
+
+        .cycle-fold summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .cycle-fold-summary-meta {
+            min-width: 0;
+            color: var(--muted);
+            font-size: 0.82rem;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .cycle-fold-body {
+            padding: 0 10px 10px;
+            display: grid;
+            gap: 10px;
+        }
+
         .cycle-timeline-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 12px;
-            margin: 14px 0 8px;
+            margin: 0;
         }
 
         .cycle-timeline-header .eyebrow {
@@ -660,6 +703,12 @@
             font-size: 0.84rem;
         }
 
+        .cycle-timeline-actions {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+        }
+
         .cycle-timeline {
             display: grid;
             gap: 8px;
@@ -667,7 +716,7 @@
 
         .cycle-step {
             display: grid;
-            grid-template-columns: auto 1fr auto;
+            grid-template-columns: auto auto 1fr auto;
             gap: 10px;
             align-items: center;
             min-width: 0;
@@ -675,6 +724,18 @@
             border: 1px solid var(--line);
             border-radius: 16px;
             background: rgba(255, 255, 255, 0.03);
+        }
+
+        .cycle-step.is-disabled {
+            opacity: 0.48;
+        }
+
+        .cycle-step-toggle {
+            width: 28px;
+            height: 34px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .cycle-step.is-active {
@@ -933,7 +994,8 @@
         }
 
         @media (max-width: 720px) {
-            .settings-grid, .sequence-grid, .cycle-toolbar, .cycle-overview, .pi-camera-settings, .pi-camera-options, .pi-camera-actions { grid-template-columns: 1fr; }
+            .settings-grid, .sequence-grid, .cycle-toolbar, .pi-camera-settings, .pi-camera-options, .pi-camera-actions { grid-template-columns: 1fr; }
+            .cycle-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .field-row { display: grid; }
             .sequence-meta {
                 align-items: stretch;
@@ -942,7 +1004,7 @@
                 display: grid;
             }
             .cycle-step {
-                grid-template-columns: auto minmax(0, 1fr);
+                grid-template-columns: auto auto minmax(0, 1fr);
             }
             .cycle-step-actions {
                 grid-column: 1 / -1;
@@ -1151,18 +1213,15 @@
             </div>
             <div class="cycle-toolbar">
                 <div class="field">
-                    <label for="cycleRandom">Selection</label>
-                    <select id="cycleRandom" class="order-select">
-                        <option value="false">Timeline order</option>
-                        <option value="true">Randomize timeline</option>
-                    </select>
-                </div>
-                <div class="field">
-                    <label for="qrSyncEnabledInput">QR Display</label>
+                    <span class="field-label">QR Display</span>
                     <label class="checkbox-field" for="qrSyncEnabledInput">
                         <input id="qrSyncEnabledInput" type="checkbox" checked>
                         <span>Show QR when idle</span>
                     </label>
+                </div>
+                <div class="field">
+                    <label for="shuffleCycleOrderBtn">Order</label>
+                    <button id="shuffleCycleOrderBtn" type="button" class="secondary">Shuffle Timeline</button>
                 </div>
             </div>
             <div class="pause-grid">
@@ -1181,63 +1240,78 @@
                     </div>
                 </div>
             </div>
-            <div class="cycle-timeline-header">
-                <div class="eyebrow">Timeline</div>
-                <button id="resetCycleOrderBtn" type="button" class="secondary cycle-reset">Library Order</button>
-            </div>
-            <div id="cycleTimeline" class="cycle-timeline"></div>
-            <div class="eyebrow" style="margin-top: 14px;">Sequence</div>
-            <div class="sequence-actions">
-                <button id="prevSequenceBtn" type="button" class="icon-button" aria-label="Previous sequence" title="Previous sequence">
-                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M15 6l-6 6 6 6"></path>
-                    </svg>
-                    <span class="sr-only">Previous sequence</span>
-                </button>
-                <select id="sequenceSelect" class="sequence-select"></select>
-                <button id="nextSequenceBtn" type="button" class="icon-button" aria-label="Next sequence" title="Next sequence">
-                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M9 6l6 6-6 6"></path>
-                    </svg>
-                    <span class="sr-only">Next sequence</span>
-                </button>
-            </div>
-            <div class="sequence-readout" aria-live="polite">
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Height</span>
-                    <span id="sequenceHeightValue" class="sequence-readout-value">-</span>
+            <details class="cycle-fold" id="cycleTimelineDetails">
+                <summary>
+                    <span>Timeline</span>
+                    <span id="cycleTimelineCount" class="cycle-fold-summary-meta">0 enabled</span>
+                </summary>
+                <div class="cycle-fold-body">
+                    <div class="cycle-timeline-actions">
+                        <button id="resetCycleOrderBtn" type="button" class="secondary cycle-reset">Library Order</button>
+                        <button id="enableAllCycleBtn" type="button" class="secondary cycle-reset">Enable All</button>
+                    </div>
+                    <div id="cycleTimeline" class="cycle-timeline"></div>
                 </div>
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Span</span>
-                    <span id="sequenceSpanValue" class="sequence-readout-value">-</span>
+            </details>
+            <details class="cycle-fold" id="sequenceDetails">
+                <summary>
+                    <span>Sequence</span>
+                    <span id="sequenceSummaryValue" class="cycle-fold-summary-meta">-</span>
+                </summary>
+                <div class="cycle-fold-body">
+                    <div class="sequence-actions">
+                        <button id="prevSequenceBtn" type="button" class="icon-button" aria-label="Previous sequence" title="Previous sequence">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M15 6l-6 6 6 6"></path>
+                            </svg>
+                            <span class="sr-only">Previous sequence</span>
+                        </button>
+                        <select id="sequenceSelect" class="sequence-select"></select>
+                        <button id="nextSequenceBtn" type="button" class="icon-button" aria-label="Next sequence" title="Next sequence">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M9 6l6 6-6 6"></path>
+                            </svg>
+                            <span class="sr-only">Next sequence</span>
+                        </button>
+                    </div>
+                    <div class="sequence-readout" aria-live="polite">
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Height</span>
+                            <span id="sequenceHeightValue" class="sequence-readout-value">-</span>
+                        </div>
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Span</span>
+                            <span id="sequenceSpanValue" class="sequence-readout-value">-</span>
+                        </div>
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Lift</span>
+                            <span id="sequenceLiftValue" class="sequence-readout-value">-</span>
+                        </div>
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Playback</span>
+                            <span id="sequencePlaybackValue" class="sequence-readout-value">-</span>
+                        </div>
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Rate</span>
+                            <span id="sequenceRateValue" class="sequence-readout-value">-</span>
+                        </div>
+                        <div class="sequence-readout-item">
+                            <span class="sequence-readout-label">Frames</span>
+                            <span id="sequenceStrideValue" class="sequence-readout-value">-</span>
+                        </div>
+                    </div>
+                    <div class="sequence-meta">
+                        <p class="footer-note" id="mediaRootNote"></p>
+                        <button id="refreshLibraryBtn" type="button" class="icon-button" aria-label="Refresh library" title="Refresh library">
+                            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                                <path d="M21 3v6h-6"></path>
+                            </svg>
+                            <span class="sr-only">Refresh library</span>
+                        </button>
+                    </div>
                 </div>
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Lift</span>
-                    <span id="sequenceLiftValue" class="sequence-readout-value">-</span>
-                </div>
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Playback</span>
-                    <span id="sequencePlaybackValue" class="sequence-readout-value">-</span>
-                </div>
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Rate</span>
-                    <span id="sequenceRateValue" class="sequence-readout-value">-</span>
-                </div>
-                <div class="sequence-readout-item">
-                    <span class="sequence-readout-label">Frames</span>
-                    <span id="sequenceStrideValue" class="sequence-readout-value">-</span>
-                </div>
-            </div>
-            <div class="sequence-meta">
-                <p class="footer-note" id="mediaRootNote"></p>
-                <button id="refreshLibraryBtn" type="button" class="icon-button" aria-label="Refresh library" title="Refresh library">
-                    <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
-                        <path d="M21 3v6h-6"></path>
-                    </svg>
-                    <span class="sr-only">Refresh library</span>
-                </button>
-            </div>
+            </details>
         </section>
 
         <details class="panel" id="previewDetails">
@@ -1335,13 +1409,15 @@
         const qrSyncDebugInput = $("#qrSyncDebugInput");
         const qrSyncGuardRange = $("#qrSyncGuardRange");
         const qrSyncGuardValue = $("#qrSyncGuardValue");
-        const cycleRandom = $("#cycleRandom");
         const cyclePhaseValue = $("#cyclePhaseValue");
         const cycleCurrentValue = $("#cycleCurrentValue");
         const cycleNextValue = $("#cycleNextValue");
         const cycleOrderValue = $("#cycleOrderValue");
+        const cycleTimelineCount = $("#cycleTimelineCount");
         const cycleTimeline = $("#cycleTimeline");
+        const shuffleCycleOrderBtn = $("#shuffleCycleOrderBtn");
         const resetCycleOrderBtn = $("#resetCycleOrderBtn");
+        const enableAllCycleBtn = $("#enableAllCycleBtn");
         const pauseExtendInput = $("#pauseExtendInput");
         const pauseRetractInput = $("#pauseRetractInput");
         const sequenceSelect = $("#sequenceSelect");
@@ -1351,6 +1427,7 @@
         const sequencePlaybackValue = $("#sequencePlaybackValue");
         const sequenceRateValue = $("#sequenceRateValue");
         const sequenceStrideValue = $("#sequenceStrideValue");
+        const sequenceSummaryValue = $("#sequenceSummaryValue");
         const mediaRootNote = $("#mediaRootNote");
         const previewImage = $("#previewImage");
         const previewVideo = $("#previewVideo");
@@ -1859,6 +1936,17 @@
             return ordered;
         }
 
+        function cycleDisabledIdSetFromState(state = currentState) {
+            const ordered = new Set(cycleOrderIdsFromState(state));
+            const disabled = Array.isArray(state?.cycle_disabled_ids) ? state.cycle_disabled_ids : [];
+            return new Set(disabled.filter((sequenceId) => ordered.has(sequenceId)));
+        }
+
+        function cycleEnabledIdsFromState(state = currentState) {
+            const disabled = cycleDisabledIdSetFromState(state);
+            return cycleOrderIdsFromState(state).filter((sequenceId) => !disabled.has(sequenceId));
+        }
+
         function sequenceNameForId(sequenceId, fallback = "-") {
             if (!sequenceId) return fallback;
             const item = libraryItemById(sequenceId);
@@ -1873,15 +1961,17 @@
 
         function renderCyclePanel(state) {
             const orderIds = cycleOrderIdsFromState(state);
+            const disabledIds = cycleDisabledIdSetFromState(state);
+            const enabledIds = orderIds.filter((sequenceId) => !disabledIds.has(sequenceId));
             const pendingId = state.cycle_pending_sequence_id || null;
-            const nextLabel = state.cycle_random && !pendingId
-                ? "Random"
-                : sequenceNameForId(state.cycle_next_sequence_id || pendingId, "-");
+            const nextLabel = sequenceNameForId(state.cycle_next_sequence_id || pendingId, "-");
 
             cyclePhaseValue.textContent = getRunStatus(state).text;
             cycleCurrentValue.textContent = sequenceNameForId(state.selected_sequence_id, "-");
             cycleNextValue.textContent = nextLabel;
-            cycleOrderValue.textContent = state.cycle_random ? `${orderIds.length} random` : `${orderIds.length} ordered`;
+            cycleOrderValue.textContent = `${enabledIds.length}/${orderIds.length} enabled`;
+            cycleTimelineCount.textContent = `${enabledIds.length} enabled`;
+            sequenceSummaryValue.textContent = sequenceNameForId(state.selected_sequence_id, "-");
 
             if (!orderIds.length) {
                 cycleTimeline.innerHTML = `<div class="preview-empty" style="position: static; min-height: 90px;">No media sequences found.</div>`;
@@ -1892,16 +1982,21 @@
                 const item = libraryItemById(sequenceId);
                 const isActive = sequenceId === state.selected_sequence_id;
                 const isPending = sequenceId === pendingId;
+                const isDisabled = disabledIds.has(sequenceId);
                 const classes = [
                     "cycle-step",
                     isActive ? "is-active" : "",
-                    isPending ? "is-pending" : ""
+                    isPending ? "is-pending" : "",
+                    isDisabled ? "is-disabled" : ""
                 ].filter(Boolean).join(" ");
                 const tag = isPending
                     ? "Next"
-                    : (isActive ? "Current" : describeTimelineItem(item));
+                    : (isDisabled ? "Skipped" : (isActive ? "Current" : describeTimelineItem(item)));
                 return `
                     <div class="${classes}" data-sequence-id="${escapeHtml(sequenceId)}">
+                        <label class="cycle-step-toggle" aria-label="Include ${escapeHtml(item?.name || sequenceId)}">
+                            <input type="checkbox" data-cycle-action="enabled" data-sequence-id="${escapeHtml(sequenceId)}" ${isDisabled ? "" : "checked"}>
+                        </label>
                         <span class="cycle-step-index">${index + 1}</span>
                         <button type="button" class="cycle-step-main secondary" data-cycle-action="select" data-sequence-id="${escapeHtml(sequenceId)}">
                             <span class="cycle-step-name">${escapeHtml(item?.name || sequenceId)}</span>
@@ -2026,7 +2121,6 @@
             qrSyncDebugInput.checked = state.qr_sync_debug_enabled !== false;
             syncFieldValue(qrSyncGuardRange, state.qr_sync_guard_sec ?? DEFAULT_QR_GUARD_SEC);
             syncQrSettingsUi();
-            syncFieldValue(cycleRandom, String(state.cycle_random));
             syncFieldValue(pauseExtendInput, state.cycle_pause_extend_sec);
             syncFieldValue(pauseRetractInput, state.cycle_pause_retract_sec);
             syncFieldValue(sequenceSelect, state.selected_sequence_id || "");
@@ -2488,12 +2582,25 @@
             pauseRetractInput.value = String(value);
             pushSettings({ cycle_pause_retract_sec: value }).catch(() => {});
         });
-        cycleRandom.addEventListener("change", () => { holdFormSync(); pushSettings({ cycle_random: cycleRandom.value === "true" }).catch(() => {}); });
-
         sequenceSelect.addEventListener("change", async () => {
             holdFormSync();
             await pushSettings({ sequence_id: sequenceSelect.value || null });
             await loadSequence(sequenceSelect.value || null);
+        });
+
+        cycleTimeline.addEventListener("change", async (event) => {
+            const input = event.target.closest('input[type="checkbox"][data-cycle-action="enabled"]');
+            if (!input) return;
+            const sequenceId = input.dataset.sequenceId;
+            if (!sequenceId) return;
+            const disabled = cycleDisabledIdSetFromState();
+            if (input.checked) {
+                disabled.delete(sequenceId);
+            } else {
+                disabled.add(sequenceId);
+            }
+            holdFormSync();
+            await pushSettings({ cycle_disabled_ids: [...disabled] });
         });
 
         cycleTimeline.addEventListener("click", async (event) => {
@@ -2523,7 +2630,27 @@
 
         resetCycleOrderBtn.addEventListener("click", async () => {
             holdFormSync();
-            await pushSettings({ cycle_order_ids: libraryItems.map((item) => item.id) });
+            await pushSettings({
+                cycle_order_ids: libraryItems.map((item) => item.id),
+                cycle_disabled_ids: []
+            });
+        });
+
+        enableAllCycleBtn.addEventListener("click", async () => {
+            holdFormSync();
+            await pushSettings({ cycle_disabled_ids: [] });
+        });
+
+        shuffleCycleOrderBtn.addEventListener("click", async () => {
+            const enabled = cycleEnabledIdsFromState();
+            const disabled = cycleOrderIdsFromState().filter((sequenceId) => !enabled.includes(sequenceId));
+            const shuffled = [...enabled];
+            for (let index = shuffled.length - 1; index > 0; index -= 1) {
+                const swapIndex = Math.floor(Math.random() * (index + 1));
+                [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+            }
+            holdFormSync();
+            await pushSettings({ cycle_order_ids: [...shuffled, ...disabled] });
         });
 
         document.addEventListener("contextmenu", (event) => {

@@ -613,6 +613,7 @@ class InstallationController:
         self.cycle_pause_retract_sec = 2.0
         self.cycle_random = False
         self.cycle_order_ids: list[str] = []
+        self.cycle_disabled_ids: set[str] = set()
         self.selected_sequence_id: str | None = None
         self.is_cycling = False
         self.is_cycle_paused = False
@@ -668,10 +669,13 @@ class InstallationController:
         self.speed_duty = clamp(float(data.get("speed_duty", self.speed_duty)), 0.1, 1.0)
         self.cycle_pause_extend_sec = max(0.0, float(data.get("cycle_pause_extend_sec", self.cycle_pause_extend_sec)))
         self.cycle_pause_retract_sec = max(0.0, float(data.get("cycle_pause_retract_sec", self.cycle_pause_retract_sec)))
-        self.cycle_random = bool(data.get("cycle_random", self.cycle_random))
+        self.cycle_random = False
         cycle_order_ids = data.get("cycle_order_ids")
         if isinstance(cycle_order_ids, list):
             self.cycle_order_ids = [str(item) for item in cycle_order_ids if isinstance(item, str) and item]
+        cycle_disabled_ids = data.get("cycle_disabled_ids")
+        if isinstance(cycle_disabled_ids, list):
+            self.cycle_disabled_ids = {str(item) for item in cycle_disabled_ids if isinstance(item, str) and item}
         self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
         self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
         qr_settings_version = int(coerce_float(data.get("qr_sync_settings_version"), 0))
@@ -689,6 +693,7 @@ class InstallationController:
     def _save_settings(self) -> None:
         with self.state_lock:
             cycle_order_ids = list(self.cycle_order_ids)
+            cycle_disabled_ids = set(self.cycle_disabled_ids)
             payload = {
                 "target_pct": round(self.target_pct, 2),
                 "delay_sec": self.delay_sec,
@@ -697,13 +702,16 @@ class InstallationController:
                 "cycle_pause_retract_sec": round(self.cycle_pause_retract_sec, 2),
                 "cycle_random": self.cycle_random,
                 "cycle_order_ids": [],
+                "cycle_disabled_ids": [],
                 "selected_sequence_id": self.selected_sequence_id,
                 "qr_sync_enabled": self.qr_sync_enabled,
                 "qr_sync_debug_enabled": self.qr_sync_debug_enabled,
                 "qr_sync_guard_sec": round(self.qr_sync_guard_sec, 2),
                 "qr_sync_settings_version": QR_SYNC_SETTINGS_VERSION,
             }
-        payload["cycle_order_ids"] = self._normalize_cycle_order_ids(cycle_order_ids)
+        normalized_order = self._normalize_cycle_order_ids(cycle_order_ids)
+        payload["cycle_order_ids"] = normalized_order
+        payload["cycle_disabled_ids"] = self._normalize_cycle_disabled_ids(cycle_disabled_ids, normalized_order)
         temp_path = STATE_FILE.with_suffix(".tmp")
         body = json.dumps(payload, indent=2)
         with self.settings_io_lock:
@@ -770,10 +778,34 @@ class InstallationController:
                 normalized.append(sequence_id)
         return normalized
 
+    def _normalize_cycle_disabled_ids(
+        self,
+        configured_ids: set[str] | list[str] | None = None,
+        order_ids: list[str] | None = None,
+    ) -> list[str]:
+        order_ids = order_ids or self._normalize_cycle_order_ids()
+        valid_ids = set(order_ids)
+        if configured_ids is None:
+            with self.state_lock:
+                configured_ids = set(self.cycle_disabled_ids)
+        disabled = {str(sequence_id) for sequence_id in configured_ids if str(sequence_id) in valid_ids}
+        return [sequence_id for sequence_id in order_ids if sequence_id in disabled]
+
+    def _enabled_cycle_order_ids(
+        self,
+        order_ids: list[str] | None = None,
+        disabled_ids: set[str] | list[str] | None = None,
+    ) -> list[str]:
+        order_ids = order_ids or self._normalize_cycle_order_ids()
+        disabled = set(self._normalize_cycle_disabled_ids(disabled_ids, order_ids))
+        return [sequence_id for sequence_id in order_ids if sequence_id not in disabled]
+
     def _ensure_cycle_order(self) -> list[str]:
         normalized = self._normalize_cycle_order_ids()
+        disabled = self._normalize_cycle_disabled_ids(order_ids=normalized)
         with self.state_lock:
             self.cycle_order_ids = normalized
+            self.cycle_disabled_ids = set(disabled)
         return normalized
 
     def get_library(self) -> list[dict[str, Any]]:
@@ -830,7 +862,7 @@ class InstallationController:
             self.qr_sync_enabled = not self.qr_sync_enabled
 
     def _pick_advanced_sequence_id(self, step: int = 1, randomize: bool = False) -> str | None:
-        ordered = self._normalize_cycle_order_ids()
+        ordered = self._enabled_cycle_order_ids()
         if not ordered:
             return None
 
@@ -1140,6 +1172,7 @@ class InstallationController:
             display_backend_mode = self.display_backend_mode
             display_backend_status = self.display_backend_status
             cycle_order_ids = list(self.cycle_order_ids)
+            cycle_disabled_ids = set(self.cycle_disabled_ids)
 
         now = time.time()
         with self.state_lock:
@@ -1165,9 +1198,13 @@ class InstallationController:
 
         sequence = self.library.get(selected_sequence_id)
         cycle_order_ids = self._normalize_cycle_order_ids(cycle_order_ids)
+        cycle_disabled_ids = self._normalize_cycle_disabled_ids(cycle_disabled_ids, cycle_order_ids)
+        cycle_enabled_ids = self._enabled_cycle_order_ids(cycle_order_ids, cycle_disabled_ids)
         cycle_next_sequence_id = cycle_pending_sequence_id
-        if cycle_next_sequence_id is None and not cycle_random and selected_sequence_id in cycle_order_ids:
-            cycle_next_sequence_id = cycle_order_ids[(cycle_order_ids.index(selected_sequence_id) + 1) % len(cycle_order_ids)]
+        if cycle_next_sequence_id is None and selected_sequence_id in cycle_enabled_ids:
+            cycle_next_sequence_id = cycle_enabled_ids[(cycle_enabled_ids.index(selected_sequence_id) + 1) % len(cycle_enabled_ids)]
+        elif cycle_next_sequence_id is None and cycle_enabled_ids:
+            cycle_next_sequence_id = cycle_enabled_ids[0]
         cycle_next_sequence = self.library.get(cycle_next_sequence_id)
         state = {
             "server_time_ms": int(now * 1000),
@@ -1188,6 +1225,9 @@ class InstallationController:
             "cycle_pause_retract_sec": cycle_pause_retract_sec,
             "cycle_random": cycle_random,
             "cycle_order_ids": cycle_order_ids,
+            "cycle_disabled_ids": cycle_disabled_ids,
+            "cycle_enabled_ids": cycle_enabled_ids,
+            "cycle_enabled_count": len(cycle_enabled_ids),
             "cycle_next_sequence_id": cycle_next_sequence_id,
             "cycle_next_sequence_name": cycle_next_sequence.name if cycle_next_sequence else None,
             "is_moving": is_moving,
@@ -1250,6 +1290,18 @@ class InstallationController:
                         raise ValueError("cycle_order_ids must be a list")
                     requested_order = [str(item) for item in raw_order if isinstance(item, str) and item]
                     self.cycle_order_ids = self._normalize_cycle_order_ids(requested_order)
+                    self.cycle_disabled_ids = set(
+                        self._normalize_cycle_disabled_ids(self.cycle_disabled_ids, self.cycle_order_ids)
+                    )
+                    self.cycle_random = False
+                if "cycle_disabled_ids" in payload:
+                    raw_disabled = payload["cycle_disabled_ids"]
+                    if not isinstance(raw_disabled, list):
+                        raise ValueError("cycle_disabled_ids must be a list")
+                    requested_disabled = [str(item) for item in raw_disabled if isinstance(item, str) and item]
+                    self.cycle_disabled_ids = set(
+                        self._normalize_cycle_disabled_ids(requested_disabled, self.cycle_order_ids)
+                    )
                 if "qr_sync_enabled" in payload:
                     self.qr_sync_enabled = bool(payload["qr_sync_enabled"])
                 if "qr_sync_debug_enabled" in payload:
@@ -1680,7 +1732,7 @@ class InstallationController:
                     duty = self.speed_duty
                     pause_extend = self.cycle_pause_extend_sec
                     pause_retract = self.cycle_pause_retract_sec
-                    randomize = self.cycle_random
+                    randomize = False
 
                 if not self._cycle_move_to_target(100.0, duty, cycle_token):
                     break
