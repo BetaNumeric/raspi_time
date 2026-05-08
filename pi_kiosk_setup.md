@@ -69,9 +69,17 @@ If you want it to auto-start at login too:
 ./install_pi_launchers.sh --autostart
 ```
 
-If the boot service is already running, the launcher will reuse that server and
-turn on MPV there, so the switch stays available before the desktop session is
-ready.
+If the boot service is already running, the launcher reuses that server and
+passes the desktop session environment to it before starting MPV. This matters
+because a boot-time systemd service normally does not know `DISPLAY`,
+`WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR`, and MPV needs those values to open a
+fullscreen window on the logged-in desktop.
+
+The autostart launcher logs to:
+
+```text
+.run/time_volume_launcher.log
+```
 
 ## 1. Start switch control on boot
 
@@ -92,30 +100,25 @@ instead of quietly running without switch/motor access.
 
 ## 2. Auto-launch the fullscreen monitor output
 
-If you use Raspberry Pi OS with desktop, create this autostart entry:
+For Raspberry Pi OS with desktop, use:
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=Time Volume Display
-Exec=chromium-browser --kiosk --app=http://127.0.0.1:8000/display
+```bash
+./install_pi_launchers.sh --autostart
 ```
 
-Save as:
+That installs a desktop-session autostart entry at:
 
 ```text
-/home/pi/.config/autostart/time-volume-display.desktop
+~/.config/autostart/Start Time Volume.desktop
 ```
 
-On some Pi images the browser command is `chromium` instead of `chromium-browser`.
-
-If the server is already up from the boot service, this launcher does not replace
-it. It asks the live server to start MPV, which is what makes the display appear
-after login without losing early switch polling.
+The entry runs `start_time_volume_autostart.sh`, which waits briefly for the
+graphical session, starts or reuses the controller server, and retries the MPV
+fullscreen display startup.
 
 ## Why this setup
 
 - `actuator_web.py` stays the control server.
-- Chromium acts as the fullscreen display client on the Pi monitor.
+- MPV acts as the fullscreen display client on the Pi monitor.
 - `/display` is now a clean black canvas with no corner text by default.
 - Image-sequence folders are the most reliable option for exact position-to-frame mapping.

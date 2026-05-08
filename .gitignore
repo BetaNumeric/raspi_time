@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .codex
+volumetric_time_camera/
 
 .run/
 *.log

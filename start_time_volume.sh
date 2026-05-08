@@ -7,6 +7,8 @@ PID_FILE="$RUN_DIR/time_volume_server.pid"
 BROWSER_PID_FILE="$RUN_DIR/time_volume_browser.pid"
 MPV_PID_FILE="$RUN_DIR/time_volume_mpv.pid"
 LOG_FILE="$RUN_DIR/time_volume_server.log"
+MPV_START_RETRIES="${TIME_VOLUME_MPV_START_RETRIES:-30}"
+MPV_START_RETRY_DELAY="${TIME_VOLUME_MPV_START_RETRY_DELAY:-1}"
 
 HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
@@ -71,12 +73,37 @@ PY
 start_mpv_display() {
     python3 - "$PORT" <<'PY'
 import json
+import os
 import sys
 import urllib.request
 
 port = sys.argv[1]
 url = f"http://127.0.0.1:{port}/api/action"
-payload = json.dumps({"action": "start_display"}).encode("utf-8")
+env_keys = (
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DESKTOP_SESSION",
+    "DISPLAY",
+    "HOME",
+    "LANG",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CONFIG_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_DATA_DIRS",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+)
+display_env = {}
+for key in env_keys:
+    value = os.environ.get(key)
+    if value:
+        display_env[key] = value
+payload = json.dumps({"action": "start_display", "display_env": display_env}).encode("utf-8")
 request = urllib.request.Request(
     url,
     data=payload,
@@ -88,6 +115,19 @@ with urllib.request.urlopen(request, timeout=15.0) as response:
     if response.status != 200:
         raise SystemExit(1)
 PY
+}
+
+start_mpv_display_with_retries() {
+    local attempt=1
+    while (( attempt <= MPV_START_RETRIES )); do
+        if start_mpv_display; then
+            return 0
+        fi
+        echo "MPV display start attempt ${attempt}/${MPV_START_RETRIES} failed; retrying in ${MPV_START_RETRY_DELAY}s..."
+        sleep "$MPV_START_RETRY_DELAY"
+        attempt=$((attempt + 1))
+    done
+    return 1
 }
 
 start_server() {
@@ -191,7 +231,7 @@ start_server
 
 if wait_for_server; then
     if [[ "$DISPLAY_BACKEND" == "mpv" ]]; then
-        if ! start_mpv_display; then
+        if ! start_mpv_display_with_retries; then
             echo "Server is running, but MPV display could not be started. Check $LOG_FILE"
             exit 1
         fi

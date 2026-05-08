@@ -52,8 +52,15 @@ For the Pi kiosk flow, run:
 
 Desktop autostart created by `./install_pi_launchers.sh --autostart` uses the
 same MPV display backend. If the boot service is already running, the launcher
-now asks that live server to start MPV instead of trying to replace the server,
-which keeps the switch polling online as early as possible.
+asks that live server to start MPV and passes the desktop session environment
+with the request. That lets a boot-managed server open MPV after login without
+replacing the early switch-polling process.
+
+Autostart output is logged to:
+
+```text
+.run/time_volume_launcher.log
+```
 
 The default display backend is a dedicated fullscreen MPV process. To run the
 monitor through the browser fallback at `/display` instead:

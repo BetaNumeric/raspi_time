@@ -1344,7 +1344,7 @@
                     </div>
                     <div class="field">
                         <label for="qrSyncDebugInput">QR Info Text</label>
-                        <input id="qrSyncDebugInput" type="checkbox" checked>
+                        <input id="qrSyncDebugInput" type="checkbox">
                     </div>
                     <div class="field">
                         <label class="range-label" for="qrSyncGuardRange">
@@ -2118,7 +2118,7 @@
             syncFieldValue(speedRange, state.speed_duty);
             if (!isFieldActive(speedRange)) updateSpeedLabel(state.speed_duty);
             qrSyncEnabledInput.checked = state.qr_sync_enabled !== false;
-            qrSyncDebugInput.checked = state.qr_sync_debug_enabled !== false;
+            qrSyncDebugInput.checked = state.qr_sync_debug_enabled === true;
             syncFieldValue(qrSyncGuardRange, state.qr_sync_guard_sec ?? DEFAULT_QR_GUARD_SEC);
             syncQrSettingsUi();
             syncFieldValue(pauseExtendInput, state.cycle_pause_extend_sec);

@@ -13,7 +13,11 @@ fi
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$AUTOSTART_DIR"
 
-chmod +x "$SCRIPT_DIR/start_time_volume.sh" "$SCRIPT_DIR/stop_time_volume.sh" "$SCRIPT_DIR/install_boot_service.sh"
+chmod +x \
+    "$SCRIPT_DIR/start_time_volume.sh" \
+    "$SCRIPT_DIR/start_time_volume_autostart.sh" \
+    "$SCRIPT_DIR/stop_time_volume.sh" \
+    "$SCRIPT_DIR/install_boot_service.sh"
 
 cat > "$DESKTOP_DIR/Start Time Volume.desktop" <<EOF
 [Desktop Entry]
@@ -42,11 +46,23 @@ EOF
 chmod +x "$DESKTOP_DIR/Start Time Volume.desktop" "$DESKTOP_DIR/Stop Time Volume.desktop"
 
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
-    cp "$DESKTOP_DIR/Start Time Volume.desktop" "$AUTOSTART_DIR/Start Time Volume.desktop"
+    cat > "$AUTOSTART_DIR/Start Time Volume.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Start Time Volume
+Comment=Start the Time Volume server and MPV fullscreen display after desktop login
+Path=$SCRIPT_DIR
+Exec=env TIME_VOLUME_DISPLAY_BACKEND=mpv $SCRIPT_DIR/start_time_volume_autostart.sh
+Terminal=false
+Categories=AudioVideo;Graphics;
+X-GNOME-Autostart-enabled=true
+EOF
     chmod +x "$AUTOSTART_DIR/Start Time Volume.desktop"
 fi
 
 echo "Desktop launchers created on $DESKTOP_DIR"
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
     echo "Autostart enabled."
+    echo "Autostart log: $SCRIPT_DIR/.run/time_volume_launcher.log"
 fi

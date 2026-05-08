@@ -90,18 +90,38 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
 QR_SYNC_DEFAULT_GUARD_SEC = 5.0
-QR_SYNC_SETTINGS_VERSION = 3
+QR_SYNC_SETTINGS_VERSION = 4
 QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
 QR_SYNC_CAPTURE_START_LEAD_MS = 500
 QR_SYNC_CAPTURE_STOP_PADDING_MS = 750
 QR_SYNC_DISPLAY_SIZE = (1920, 1080)
-QR_SYNC_IMAGE_CACHE_VERSION = 3
+QR_SYNC_IMAGE_CACHE_VERSION = 4
+QR_SYNC_UPCOMING_LIMIT = 4
 MPV_DEFAULT_FPS_CAP = 30.0
 DEFAULT_DISPLAY_BACKEND = "mpv"
 MPV_IPC_PATH = RUN_DIR / "time_volume_mpv.sock"
 MPV_PID_FILE = RUN_DIR / "time_volume_mpv.pid"
 MPV_BLACK_IMAGE = RUN_DIR / "mpv_black.png"
 QR_SYNC_DIR = RUN_DIR / "qr_sync"
+MPV_DISPLAY_ENV_KEYS = {
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DESKTOP_SESSION",
+    "DISPLAY",
+    "HOME",
+    "LANG",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CONFIG_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_DATA_DIRS",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+}
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -114,6 +134,18 @@ def coerce_float(value: Any, fallback: float) -> float:
     except (TypeError, ValueError):
         return fallback
     return parsed if math.isfinite(parsed) else fallback
+
+
+def normalized_mpv_display_env(display_env: Any) -> dict[str, str]:
+    if not isinstance(display_env, dict):
+        return {}
+    clean: dict[str, str] = {}
+    for key, value in display_env.items():
+        if key not in MPV_DISPLAY_ENV_KEYS or not isinstance(value, str) or "\0" in value:
+            continue
+        if value:
+            clean[key] = value
+    return clean
 
 
 def sequence_span_cm(sequence: "SequenceItem") -> tuple[float, float, float]:
@@ -181,6 +213,12 @@ def format_ms(ms: int | float | None) -> str:
         return "--"
     seconds = max(0.0, float(ms) / 1000)
     return f"{seconds:.1f}s" if seconds < 10 else f"{seconds:.0f}s"
+
+
+def format_countdown_number(ms: int | float | None) -> str:
+    if ms is None:
+        return "--"
+    return str(max(0, int(math.ceil(float(ms) / 1000))))
 
 
 def direction_label(direction: int | float | None) -> str:
@@ -632,7 +670,7 @@ class InstallationController:
         self.last_cycle_end_reason: str | None = None
         self.last_runtime_error: str | None = None
         self.qr_sync_enabled = True
-        self.qr_sync_debug_enabled = True
+        self.qr_sync_debug_enabled = False
         self.qr_sync_guard_sec = QR_SYNC_DEFAULT_GUARD_SEC
         self.qr_sync_was_moving = False
         self.qr_sync_last_motion_end_at = 0.0
@@ -642,6 +680,7 @@ class InstallationController:
         self.mpv_bin = mpv_bin
         self.mpv_fps_cap = mpv_fps_cap
         self.mpv_display: MpvDisplayBackend | None = None
+        self.mpv_display_env: dict[str, str] = {}
         self.display_backend_lock = threading.Lock()
 
         self.switch_raw_dir = 0
@@ -676,9 +715,12 @@ class InstallationController:
         cycle_disabled_ids = data.get("cycle_disabled_ids")
         if isinstance(cycle_disabled_ids, list):
             self.cycle_disabled_ids = {str(item) for item in cycle_disabled_ids if isinstance(item, str) and item}
-        self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
-        self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
         qr_settings_version = int(coerce_float(data.get("qr_sync_settings_version"), 0))
+        self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
+        if qr_settings_version < QR_SYNC_SETTINGS_VERSION:
+            self.qr_sync_debug_enabled = False
+        else:
+            self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
         legacy_guard = max(
             coerce_float(data.get("qr_sync_hide_before_start_sec"), 0.0),
             coerce_float(data.get("qr_sync_show_after_motion_sec"), 0.0),
@@ -834,8 +876,12 @@ class InstallationController:
             self.display_backend_mode = mode
             self.display_backend_status = status
 
-    def start_mpv_display(self) -> bool:
+    def start_mpv_display(self, display_env: dict[str, str] | None = None) -> bool:
         with self.display_backend_lock:
+            clean_display_env = normalized_mpv_display_env(display_env)
+            if clean_display_env:
+                self.mpv_display_env.update(clean_display_env)
+
             if self.mpv_display and self.mpv_display.process and self.mpv_display.process.poll() is None:
                 self.set_display_backend_status("mpv", "MPV fullscreen display")
                 return True
@@ -843,7 +889,12 @@ class InstallationController:
             if self.mpv_display:
                 self.mpv_display.stop()
 
-            backend = MpvDisplayBackend(self, mpv_bin=self.mpv_bin, fps_cap=self.mpv_fps_cap)
+            backend = MpvDisplayBackend(
+                self,
+                mpv_bin=self.mpv_bin,
+                fps_cap=self.mpv_fps_cap,
+                display_env=self.mpv_display_env,
+            )
             self.mpv_display = backend
             if backend.start():
                 return True
@@ -933,6 +984,80 @@ class InstallationController:
             return 0
         return min(QR_SYNC_CAPTURE_STOP_PADDING_MS, max(0, guard_ms - 500))
 
+    def _qr_sync_capture_start_offset_ms(self, sequence_start_in_ms: int | None) -> int | None:
+        if sequence_start_in_ms is None:
+            return None
+        quantum = max(1, QR_SYNC_COUNTDOWN_QUANTUM_MS)
+        rounded = int(math.floor(max(0, sequence_start_in_ms) / quantum) * quantum)
+        return max(0, rounded - QR_SYNC_CAPTURE_START_LEAD_MS)
+
+    def _qr_sync_capture_duration_ms(self, sequence_start_in_ms: int, capture_start_in_ms: int, sequence_duration_ms: int, state: dict[str, Any]) -> int:
+        return int(sequence_duration_ms + max(0, sequence_start_in_ms - capture_start_in_ms) + self._qr_sync_capture_stop_padding_ms(state))
+
+    def _qr_sync_upcoming_entries(
+        self,
+        state: dict[str, Any],
+        first_sequence: SequenceItem | None,
+        first_direction: int,
+        first_sequence_start_in_ms: int | None,
+    ) -> list[list[Any]]:
+        if not first_sequence or first_sequence_start_in_ms is None or not state.get("is_cycling"):
+            return []
+
+        enabled_ids = state.get("cycle_enabled_ids")
+        if not isinstance(enabled_ids, list) or not enabled_ids:
+            return []
+
+        sequence_id = first_sequence.id
+        if sequence_id not in enabled_ids:
+            return []
+
+        direction = first_direction if first_direction in {-1, 1} else 1
+        sequence_start_in_ms = max(0, int(first_sequence_start_in_ms))
+        duty = float(state.get("speed_duty") or 1.0)
+        entries: list[list[Any]] = []
+
+        for _ in range(QR_SYNC_UPCOMING_LIMIT + 1):
+            sequence = self.library.get(sequence_id)
+            if not sequence:
+                break
+
+            sequence_duration_ms = int(round(sequence_travel_duration_sec(sequence, direction, duty) * 1000))
+            sequence_end_in_ms = sequence_start_in_ms + sequence_duration_ms
+            pause_after_sec = state.get("cycle_pause_extend_sec") if direction > 0 else state.get("cycle_pause_retract_sec")
+            pause_after_ms = int(round(coerce_float(pause_after_sec, 0.0) * 1000))
+            next_start_in_ms = sequence_end_in_ms + max(0, pause_after_ms)
+            next_direction = -direction
+
+            try:
+                next_index = (enabled_ids.index(sequence_id) + 1) % len(enabled_ids)
+            except ValueError:
+                break
+            next_sequence_id = str(enabled_ids[next_index])
+            next_sequence = self.library.get(next_sequence_id)
+            if not next_sequence:
+                break
+
+            capture_start_in_ms = self._qr_sync_capture_start_offset_ms(next_start_in_ms)
+            if capture_start_in_ms is None:
+                break
+            next_duration_ms = int(round(sequence_travel_duration_sec(next_sequence, next_direction, duty) * 1000))
+            capture_duration_ms = self._qr_sync_capture_duration_ms(next_start_in_ms, capture_start_in_ms, next_duration_ms, state)
+            entries.append([
+                int(capture_start_in_ms),
+                int(capture_duration_ms),
+                int(next_direction),
+                next_sequence.name[:24],
+            ])
+            if len(entries) >= QR_SYNC_UPCOMING_LIMIT:
+                break
+
+            sequence_id = next_sequence_id
+            direction = next_direction
+            sequence_start_in_ms = next_start_in_ms
+
+        return entries
+
     def _qr_sync_phase(self, state: dict[str, Any]) -> str:
         phase = state.get("cycle_pause_phase")
         if isinstance(phase, str) and phase:
@@ -953,8 +1078,6 @@ class InstallationController:
                 return "before_start"
 
         if state.get("countdown_deadline_ms") is None:
-            if state.get("cycle_pause_deadline_ms") is not None:
-                return None
             last_motion_end_ms = state.get("qr_sync_last_motion_end_ms")
             if guard_ms > 0 and isinstance(last_motion_end_ms, int):
                 elapsed_ms = int(state.get("server_time_ms") or 0) - last_motion_end_ms
@@ -1021,6 +1144,9 @@ class InstallationController:
                         "h": round(sequence.volume_height_cm, 2),
                     }
                 )
+                upcoming = self._qr_sync_upcoming_entries(state, sequence, direction, start_in_ms)
+                if upcoming:
+                    payload["u"] = upcoming
             sync_url = append_url_param(str(camera_url), "tvs", base64url_json(payload))
             sync_hash = hashlib.sha1(f"qr{QR_SYNC_IMAGE_CACHE_VERSION}|{sync_url}".encode("utf-8")).hexdigest()[:16]
 
@@ -1031,7 +1157,7 @@ class InstallationController:
             "qr_sync_hash": sync_hash,
             "qr_sync_label": label,
             "qr_sync_enabled": qr_enabled,
-            "qr_sync_debug_enabled": bool(state.get("qr_sync_debug_enabled", True)),
+            "qr_sync_debug_enabled": bool(state.get("qr_sync_debug_enabled", False)),
             "qr_sync_auto_active": display_active,
             "qr_sync_standby_blackout": standby_blackout,
             "qr_sync_display_mode": display_mode,
@@ -1107,7 +1233,7 @@ class InstallationController:
             side_font = title_font = body_font = ImageFont.load_default()
 
         payload = state.get("qr_sync_payload") if isinstance(state.get("qr_sync_payload"), dict) else {}
-        countdown_text = format_ms(payload.get("si"))
+        countdown_text = format_countdown_number(payload.get("si"))
         side_margin = 100
         for angle, x in ((-90, side_margin), (90, width - side_margin)):
             text_box = draw.textbbox((0, 0), countdown_text, font=side_font)
@@ -1119,7 +1245,7 @@ class InstallationController:
             rotated = text_image.rotate(angle, expand=True)
             image.paste(rotated, (int(x - rotated.width / 2), int(height / 2 - rotated.height / 2)), rotated)
 
-        if not bool(state.get("qr_sync_debug_enabled", True)):
+        if not bool(state.get("qr_sync_debug_enabled", False)):
             path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = path.with_suffix(path.suffix + ".tmp")
             image.save(temp_path, format="PNG", optimize=True)
@@ -2051,7 +2177,8 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             elif action == "stop":
                 controller.stop_all()
             elif action == "start_display":
-                if not controller.start_mpv_display():
+                display_env = payload.get("display_env")
+                if not controller.start_mpv_display(display_env if isinstance(display_env, dict) else None):
                     raise RuntimeError("MPV display failed to start")
             elif action == "stop_display":
                 controller.stop_mpv_display()
@@ -2339,10 +2466,12 @@ class MpvDisplayBackend:
         controller: InstallationController,
         mpv_bin: str = "mpv",
         fps_cap: float = MPV_DEFAULT_FPS_CAP,
+        display_env: dict[str, str] | None = None,
     ):
         self.controller = controller
         self.mpv_bin = mpv_bin
         self.fps_cap = max(1.0, float(fps_cap))
+        self.display_env = normalized_mpv_display_env(display_env)
         self.process: subprocess.Popen[Any] | None = None
         self.sock: socket.socket | None = None
         self.reader: Any = None
@@ -2394,7 +2523,7 @@ class MpvDisplayBackend:
         ]
 
         try:
-            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=self._process_env())
             MPV_PID_FILE.write_text(str(self.process.pid), encoding="utf-8")
             self._connect()
         except Exception as exc:
@@ -2407,6 +2536,33 @@ class MpvDisplayBackend:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         return True
+
+    def _process_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(self.display_env)
+
+        runtime_dir = env.get("XDG_RUNTIME_DIR")
+        if not runtime_dir:
+            candidate = Path(f"/run/user/{os.getuid()}")
+            if candidate.exists():
+                runtime_dir = str(candidate)
+                env["XDG_RUNTIME_DIR"] = runtime_dir
+
+        if runtime_dir and not env.get("WAYLAND_DISPLAY"):
+            for name in ("wayland-0", "wayland-1"):
+                if (Path(runtime_dir) / name).exists():
+                    env["WAYLAND_DISPLAY"] = name
+                    break
+
+        if not env.get("DISPLAY") and Path("/tmp/.X11-unix/X0").exists():
+            env["DISPLAY"] = ":0"
+
+        if not env.get("XAUTHORITY"):
+            xauthority = Path(env.get("HOME") or str(Path.home())) / ".Xauthority"
+            if xauthority.exists():
+                env["XAUTHORITY"] = str(xauthority)
+
+        return env
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -2574,7 +2730,7 @@ class MpvDisplayBackend:
             self.last_speed = None
         self._set_speed(1.0)
         self._set_pause(True)
-        if Image is None and bool(state.get("qr_sync_debug_enabled", True)):
+        if Image is None and bool(state.get("qr_sync_debug_enabled", False)):
             self._show_qr_debug_text(state)
 
     def _direction_for_state(self, state: dict[str, Any]) -> int:
