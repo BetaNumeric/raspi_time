@@ -95,7 +95,7 @@ QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
 QR_SYNC_CAPTURE_START_LEAD_MS = 500
 QR_SYNC_CAPTURE_STOP_PADDING_MS = 750
 QR_SYNC_DISPLAY_SIZE = (1920, 1080)
-QR_SYNC_IMAGE_CACHE_VERSION = 4
+QR_SYNC_IMAGE_CACHE_VERSION = 5
 QR_SYNC_UPCOMING_LIMIT = 4
 MPV_DEFAULT_FPS_CAP = 30.0
 DEFAULT_DISPLAY_BACKEND = "mpv"
@@ -1212,8 +1212,9 @@ class InstallationController:
         image = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(image)
         matrix = make_qr_matrix(sync_url)
-        border = 8
-        qr_side = min(height - 170, int(width * 0.52))
+        debug_enabled = bool(state.get("qr_sync_debug_enabled", False))
+        border = 8 if debug_enabled else 4
+        qr_side = min(height - 170, int(width * 0.52)) if debug_enabled else height
         scale = max(1, qr_side // (len(matrix) + border * 2))
         pixel_size = (len(matrix) + border * 2) * scale
         qr_x = (width - pixel_size) // 2
@@ -1247,7 +1248,7 @@ class InstallationController:
             rotated = text_image.rotate(angle, expand=True)
             image.paste(rotated, (int(x - rotated.width / 2), int(height / 2 - rotated.height / 2)), rotated)
 
-        if not bool(state.get("qr_sync_debug_enabled", False)):
+        if not debug_enabled:
             path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = path.with_suffix(path.suffix + ".tmp")
             image.save(temp_path, format="PNG", optimize=True)
