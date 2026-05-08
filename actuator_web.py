@@ -825,7 +825,8 @@ class InstallationController:
         configured_ids: set[str] | list[str] | None = None,
         order_ids: list[str] | None = None,
     ) -> list[str]:
-        order_ids = order_ids or self._normalize_cycle_order_ids()
+        if order_ids is None:
+            order_ids = self._normalize_cycle_order_ids()
         valid_ids = set(order_ids)
         if configured_ids is None:
             with self.state_lock:
@@ -838,7 +839,8 @@ class InstallationController:
         order_ids: list[str] | None = None,
         disabled_ids: set[str] | list[str] | None = None,
     ) -> list[str]:
-        order_ids = order_ids or self._normalize_cycle_order_ids()
+        if order_ids is None:
+            order_ids = self._normalize_cycle_order_ids()
         disabled = set(self._normalize_cycle_disabled_ids(disabled_ids, order_ids))
         return [sequence_id for sequence_id in order_ids if sequence_id not in disabled]
 
@@ -2885,11 +2887,17 @@ class MpvDisplayBackend:
         while not self.stop_event.is_set():
             try:
                 if self.process and self.process.poll() is not None:
-                    self.controller.set_display_backend_status("browser", "MPV exited; use /display")
+                    self.controller.set_display_backend_status("mpv", "MPV exited; restarting")
                     try:
                         MPV_PID_FILE.unlink()
                     except Exception:
                         pass
+                    if not self.stop_event.is_set():
+                        threading.Thread(
+                            target=self.controller.start_mpv_display,
+                            args=(self.display_env,),
+                            daemon=True,
+                        ).start()
                     return
                 self._sync_state()
             except Exception as exc:
