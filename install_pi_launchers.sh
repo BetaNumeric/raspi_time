@@ -16,6 +16,7 @@ mkdir -p "$AUTOSTART_DIR"
 chmod +x \
     "$SCRIPT_DIR/start_time_volume.sh" \
     "$SCRIPT_DIR/start_time_volume_autostart.sh" \
+    "$SCRIPT_DIR/start_time_volume_display.sh" \
     "$SCRIPT_DIR/stop_time_volume.sh" \
     "$SCRIPT_DIR/install_boot_service.sh"
 
@@ -43,7 +44,22 @@ Terminal=false
 Categories=AudioVideo;Graphics;
 EOF
 
-chmod +x "$DESKTOP_DIR/Start Time Volume.desktop" "$DESKTOP_DIR/Stop Time Volume.desktop"
+cat > "$DESKTOP_DIR/Start Time Volume Display.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Start Time Volume Display
+Comment=Open or restart the fullscreen MPV display
+Path=$SCRIPT_DIR
+Exec=env TIME_VOLUME_DISPLAY_BACKEND=mpv $SCRIPT_DIR/start_time_volume_display.sh
+Terminal=false
+Categories=AudioVideo;Graphics;
+EOF
+
+chmod +x \
+    "$DESKTOP_DIR/Start Time Volume.desktop" \
+    "$DESKTOP_DIR/Stop Time Volume.desktop" \
+    "$DESKTOP_DIR/Start Time Volume Display.desktop"
 
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
     cat > "$AUTOSTART_DIR/Start Time Volume.desktop" <<EOF
@@ -62,6 +78,9 @@ EOF
 fi
 
 echo "Desktop launchers created on $DESKTOP_DIR"
+echo "  Start Time Volume.desktop"
+echo "  Stop Time Volume.desktop"
+echo "  Start Time Volume Display.desktop"
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
     echo "Autostart enabled."
     echo "Autostart log: $SCRIPT_DIR/.run/time_volume_launcher.log"

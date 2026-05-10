@@ -95,8 +95,13 @@ QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
 QR_SYNC_CAPTURE_START_LEAD_MS = 500
 QR_SYNC_CAPTURE_STOP_PADDING_MS = 750
 QR_SYNC_DISPLAY_SIZE = (1920, 1080)
-QR_SYNC_IMAGE_CACHE_VERSION = 5
-QR_SYNC_UPCOMING_LIMIT = 4
+QR_SYNC_IMAGE_CACHE_VERSION = 8
+QR_SYNC_DEFAULT_UPCOMING_COUNT = 2
+QR_SYNC_MAX_UPCOMING_COUNT = 6
+QR_SYNC_DEFAULT_NAME_COUNT = 1
+QR_SYNC_MAX_NAME_COUNT = 7
+QR_SYNC_DEFAULT_NAME_CHARS = 32
+QR_SYNC_MAX_NAME_CHARS = 64
 MPV_DEFAULT_FPS_CAP = 30.0
 DEFAULT_DISPLAY_BACKEND = "mpv"
 MPV_IPC_PATH = RUN_DIR / "time_volume_mpv.sock"
@@ -671,6 +676,9 @@ class InstallationController:
         self.last_runtime_error: str | None = None
         self.qr_sync_enabled = True
         self.qr_sync_debug_enabled = False
+        self.qr_sync_upcoming_count = QR_SYNC_DEFAULT_UPCOMING_COUNT
+        self.qr_sync_name_count = QR_SYNC_DEFAULT_NAME_COUNT
+        self.qr_sync_name_chars = QR_SYNC_DEFAULT_NAME_CHARS
         self.qr_sync_guard_sec = QR_SYNC_DEFAULT_GUARD_SEC
         self.qr_sync_was_moving = False
         self.qr_sync_last_motion_end_at = 0.0
@@ -721,6 +729,11 @@ class InstallationController:
             self.qr_sync_debug_enabled = False
         else:
             self.qr_sync_debug_enabled = bool(data.get("qr_sync_debug_enabled", self.qr_sync_debug_enabled))
+        legacy_include_name = bool(data.get("qr_sync_include_name", True))
+        default_name_count = QR_SYNC_DEFAULT_NAME_COUNT if legacy_include_name else 0
+        self.qr_sync_upcoming_count = int(clamp(coerce_float(data.get("qr_sync_upcoming_count"), self.qr_sync_upcoming_count), 0, QR_SYNC_MAX_UPCOMING_COUNT))
+        self.qr_sync_name_count = int(clamp(coerce_float(data.get("qr_sync_name_count"), default_name_count), 0, QR_SYNC_MAX_NAME_COUNT))
+        self.qr_sync_name_chars = int(clamp(coerce_float(data.get("qr_sync_name_chars"), self.qr_sync_name_chars), 0, QR_SYNC_MAX_NAME_CHARS))
         legacy_guard = max(
             coerce_float(data.get("qr_sync_hide_before_start_sec"), 0.0),
             coerce_float(data.get("qr_sync_show_after_motion_sec"), 0.0),
@@ -748,6 +761,9 @@ class InstallationController:
                 "selected_sequence_id": self.selected_sequence_id,
                 "qr_sync_enabled": self.qr_sync_enabled,
                 "qr_sync_debug_enabled": self.qr_sync_debug_enabled,
+                "qr_sync_upcoming_count": self.qr_sync_upcoming_count,
+                "qr_sync_name_count": self.qr_sync_name_count,
+                "qr_sync_name_chars": self.qr_sync_name_chars,
                 "qr_sync_guard_sec": round(self.qr_sync_guard_sec, 2),
                 "qr_sync_settings_version": QR_SYNC_SETTINGS_VERSION,
             }
@@ -878,15 +894,18 @@ class InstallationController:
             self.display_backend_mode = mode
             self.display_backend_status = status
 
-    def start_mpv_display(self, display_env: dict[str, str] | None = None) -> bool:
+    def start_mpv_display(self, display_env: dict[str, str] | None = None, force_restart: bool = False) -> bool:
         with self.display_backend_lock:
             clean_display_env = normalized_mpv_display_env(display_env)
             if clean_display_env:
                 self.mpv_display_env.update(clean_display_env)
 
             if self.mpv_display and self.mpv_display.process and self.mpv_display.process.poll() is None:
-                self.set_display_backend_status("mpv", "MPV fullscreen display")
-                return True
+                if not force_restart:
+                    self.set_display_backend_status("mpv", "MPV fullscreen display")
+                    return True
+                self.mpv_display.stop()
+                self.mpv_display = None
 
             if self.mpv_display:
                 self.mpv_display.stop()
@@ -1003,13 +1022,16 @@ class InstallationController:
         first_direction: int,
         first_sequence_start_in_ms: int | None,
     ) -> list[list[Any]]:
-        if not first_sequence or first_sequence_start_in_ms is None or not state.get("is_cycling"):
+        upcoming_count = int(clamp(coerce_float(state.get("qr_sync_upcoming_count"), QR_SYNC_DEFAULT_UPCOMING_COUNT), 0, QR_SYNC_MAX_UPCOMING_COUNT))
+        if upcoming_count <= 0 or not first_sequence or first_sequence_start_in_ms is None or not state.get("is_cycling"):
             return []
 
         enabled_ids = state.get("cycle_enabled_ids")
         if not isinstance(enabled_ids, list) or not enabled_ids:
             return []
 
+        name_count = int(clamp(coerce_float(state.get("qr_sync_name_count"), QR_SYNC_DEFAULT_NAME_COUNT), 0, QR_SYNC_MAX_NAME_COUNT))
+        name_chars = int(clamp(coerce_float(state.get("qr_sync_name_chars"), QR_SYNC_DEFAULT_NAME_CHARS), 0, QR_SYNC_MAX_NAME_CHARS))
         sequence_id = first_sequence.id
         if sequence_id not in enabled_ids:
             return []
@@ -1019,7 +1041,7 @@ class InstallationController:
         duty = float(state.get("speed_duty") or 1.0)
         entries: list[list[Any]] = []
 
-        for _ in range(QR_SYNC_UPCOMING_LIMIT + 1):
+        for _ in range(upcoming_count + 1):
             sequence = self.library.get(sequence_id)
             if not sequence:
                 break
@@ -1045,13 +1067,15 @@ class InstallationController:
                 break
             next_duration_ms = int(round(sequence_travel_duration_sec(next_sequence, next_direction, duty) * 1000))
             capture_duration_ms = self._qr_sync_capture_duration_ms(next_start_in_ms, capture_start_in_ms, next_duration_ms, state)
-            entries.append([
+            entry: list[Any] = [
                 int(capture_start_in_ms),
                 int(capture_duration_ms),
                 int(next_direction),
-                next_sequence.name[:24],
-            ])
-            if len(entries) >= QR_SYNC_UPCOMING_LIMIT:
+            ]
+            if name_chars > 0 and name_count >= len(entries) + 2:
+                entry.append(next_sequence.name[:name_chars])
+            entries.append(entry)
+            if len(entries) >= upcoming_count:
                 break
 
             sequence_id = next_sequence_id
@@ -1127,25 +1151,15 @@ class InstallationController:
                 payload_duration_ms += max(0, start_in_ms - payload_start_in_ms)
                 payload_duration_ms += self._qr_sync_capture_stop_padding_ms(state)
 
-            payload = {
-                "v": 1,
-                "si": payload_start_in_ms,
-                "du": payload_duration_ms,
-                "d": direction,
-                "ph": self._qr_sync_phase(state),
-            }
+            payload = {"v": 1}
+            if payload_start_in_ms is not None and payload_duration_ms is not None:
+                payload["si"] = payload_start_in_ms
+                payload["du"] = payload_duration_ms
             if sequence:
-                payload.update(
-                    {
-                        "id": sequence.id[:72],
-                        "n": sequence.name[:48],
-                        "k": "i" if sequence.kind == "images" else "v",
-                        "fr": int(sequence.frame_count or 0),
-                        "st": round(sequence.start_cm, 2),
-                        "en": round(sequence.end_cm, 2),
-                        "h": round(sequence.volume_height_cm, 2),
-                    }
-                )
+                name_count = int(clamp(coerce_float(state.get("qr_sync_name_count"), QR_SYNC_DEFAULT_NAME_COUNT), 0, QR_SYNC_MAX_NAME_COUNT))
+                name_chars = int(clamp(coerce_float(state.get("qr_sync_name_chars"), QR_SYNC_DEFAULT_NAME_CHARS), 0, QR_SYNC_MAX_NAME_CHARS))
+                if name_count >= 1 and name_chars > 0:
+                    payload["n"] = sequence.name[:name_chars]
                 upcoming = self._qr_sync_upcoming_entries(state, sequence, direction, start_in_ms)
                 if upcoming:
                     payload["u"] = upcoming
@@ -1197,9 +1211,7 @@ class InstallationController:
             f"NEXT: {payload.get('n') or state.get('qr_sync_label') or 'CAMERA'}",
             f"STARTS IN: {format_ms(payload.get('si'))}",
             f"CAPTURE: {format_ms(payload.get('du'))}",
-            f"DIRECTION: {direction_label(payload.get('d'))}",
-            f"PHASE: {payload.get('ph') or 'idle'}",
-            f"FRAMES: {payload.get('fr') or '--'}",
+            f"STATE: {'scheduled' if payload.get('si') is not None and payload.get('du') is not None else 'idle'}",
             f"BLACKOUT: {format_ms(float(state.get('qr_sync_guard_sec') or 0.0) * 1000)}",
         ]
 
@@ -1214,19 +1226,21 @@ class InstallationController:
         matrix = make_qr_matrix(sync_url)
         debug_enabled = bool(state.get("qr_sync_debug_enabled", False))
         border = 8 if debug_enabled else 4
-        qr_side = min(height - 170, int(width * 0.52)) if debug_enabled else height
-        scale = max(1, qr_side // (len(matrix) + border * 2))
-        pixel_size = (len(matrix) + border * 2) * scale
-        qr_x = (width - pixel_size) // 2
-        qr_y = (height - pixel_size) // 2
-
-        draw.rectangle((qr_x, qr_y, qr_x + pixel_size, qr_y + pixel_size), fill="white")
+        qr_modules = len(matrix) + border * 2
+        qr_bitmap = Image.new("RGB", (qr_modules, qr_modules), "white")
+        qr_draw = ImageDraw.Draw(qr_bitmap)
         for module_y, row in enumerate(matrix):
-            y0 = qr_y + (module_y + border) * scale
             for module_x, dark in enumerate(row):
                 if dark:
-                    x0 = qr_x + (module_x + border) * scale
-                    draw.rectangle((x0, y0, x0 + scale - 1, y0 + scale - 1), fill="black")
+                    x0 = module_x + border
+                    y0 = module_y + border
+                    qr_draw.point((x0, y0), fill="black")
+
+        resample_nearest = getattr(getattr(Image, "Resampling", Image), "NEAREST", Image.NEAREST)
+        pixel_size = height
+        qr_x = (width - pixel_size) // 2
+        qr_y = 0
+        image.paste(qr_bitmap.resize((pixel_size, pixel_size), resample_nearest), (qr_x, qr_y))
 
         try:
             side_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 180)
@@ -1297,6 +1311,9 @@ class InstallationController:
             last_runtime_error = self.last_runtime_error
             qr_sync_enabled = self.qr_sync_enabled
             qr_sync_debug_enabled = self.qr_sync_debug_enabled
+            qr_sync_upcoming_count = self.qr_sync_upcoming_count
+            qr_sync_name_count = self.qr_sync_name_count
+            qr_sync_name_chars = self.qr_sync_name_chars
             qr_sync_guard_sec = round(self.qr_sync_guard_sec, 2)
             display_backend_mode = self.display_backend_mode
             display_backend_status = self.display_backend_status
@@ -1389,6 +1406,9 @@ class InstallationController:
             "camera_url": configured_camera_url(),
             "qr_sync_enabled": qr_sync_enabled,
             "qr_sync_debug_enabled": qr_sync_debug_enabled,
+            "qr_sync_upcoming_count": qr_sync_upcoming_count,
+            "qr_sync_name_count": qr_sync_name_count,
+            "qr_sync_name_chars": qr_sync_name_chars,
             "qr_sync_guard_sec": qr_sync_guard_sec,
             "qr_sync_last_motion_end_ms": int(qr_sync_last_motion_end_at * 1000) if qr_sync_last_motion_end_at > 0 else None,
         }
@@ -1435,6 +1455,12 @@ class InstallationController:
                     self.qr_sync_enabled = bool(payload["qr_sync_enabled"])
                 if "qr_sync_debug_enabled" in payload:
                     self.qr_sync_debug_enabled = bool(payload["qr_sync_debug_enabled"])
+                if "qr_sync_upcoming_count" in payload:
+                    self.qr_sync_upcoming_count = int(clamp(float(payload["qr_sync_upcoming_count"]), 0, QR_SYNC_MAX_UPCOMING_COUNT))
+                if "qr_sync_name_count" in payload:
+                    self.qr_sync_name_count = int(clamp(float(payload["qr_sync_name_count"]), 0, QR_SYNC_MAX_NAME_COUNT))
+                if "qr_sync_name_chars" in payload:
+                    self.qr_sync_name_chars = int(clamp(float(payload["qr_sync_name_chars"]), 0, QR_SYNC_MAX_NAME_CHARS))
                 if "qr_sync_guard_sec" in payload:
                     self.qr_sync_guard_sec = clamp(float(payload["qr_sync_guard_sec"]), 0.0, 60.0)
                 if "sequence_id" in payload:
@@ -2181,7 +2207,8 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.stop_all()
             elif action == "start_display":
                 display_env = payload.get("display_env")
-                if not controller.start_mpv_display(display_env if isinstance(display_env, dict) else None):
+                force_restart = bool(payload.get("force_restart", True))
+                if not controller.start_mpv_display(display_env if isinstance(display_env, dict) else None, force_restart=force_restart):
                     raise RuntimeError("MPV display failed to start")
             elif action == "stop_display":
                 controller.stop_mpv_display()

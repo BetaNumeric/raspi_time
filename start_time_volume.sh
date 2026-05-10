@@ -103,7 +103,11 @@ for key in env_keys:
     value = os.environ.get(key)
     if value:
         display_env[key] = value
-payload = json.dumps({"action": "start_display", "display_env": display_env}).encode("utf-8")
+payload = json.dumps({
+    "action": "start_display",
+    "display_env": display_env,
+    "force_restart": True,
+}).encode("utf-8")
 request = urllib.request.Request(
     url,
     data=payload,

@@ -1343,15 +1343,42 @@
                         <div class="hint" id="speedValue">100%</div>
                     </div>
                     <div class="field">
-                        <label for="qrSyncDebugInput">QR Info Text</label>
-                        <input id="qrSyncDebugInput" type="checkbox">
-                    </div>
-                    <div class="field">
                         <label class="range-label" for="qrSyncGuardRange">
                             <span>QR Blackout</span>
                             <span id="qrSyncGuardValue" class="range-value">5s</span>
                         </label>
                         <input id="qrSyncGuardRange" type="range" min="0" max="30" step="0.25" value="5">
+                    </div>
+                </section>
+
+                <section>
+                    <div class="eyebrow">QR Payload</div>
+                    <div class="settings-grid" style="margin-top: 10px;">
+                        <div class="field">
+                            <label for="qrSyncDebugInput">Info Text</label>
+                            <input id="qrSyncDebugInput" type="checkbox">
+                        </div>
+                        <div class="field">
+                            <label class="range-label" for="qrSyncUpcomingRange">
+                                <span>Upcoming Timings</span>
+                                <span id="qrSyncUpcomingValue" class="range-value">2</span>
+                            </label>
+                            <input id="qrSyncUpcomingRange" type="range" min="0" max="6" step="1" value="2">
+                        </div>
+                        <div class="field">
+                            <label class="range-label" for="qrSyncNameCountRange">
+                                <span>Names</span>
+                                <span id="qrSyncNameCountValue" class="range-value">1</span>
+                            </label>
+                            <input id="qrSyncNameCountRange" type="range" min="0" max="7" step="1" value="1">
+                        </div>
+                        <div class="field">
+                            <label class="range-label" for="qrSyncNameCharsRange">
+                                <span>Name Characters</span>
+                                <span id="qrSyncNameCharsValue" class="range-value">32</span>
+                            </label>
+                            <input id="qrSyncNameCharsRange" type="range" min="0" max="64" step="4" value="32">
+                        </div>
                     </div>
                 </section>
 
@@ -1407,6 +1434,12 @@
         const speedValue = $("#speedValue");
         const qrSyncEnabledInput = $("#qrSyncEnabledInput");
         const qrSyncDebugInput = $("#qrSyncDebugInput");
+        const qrSyncUpcomingRange = $("#qrSyncUpcomingRange");
+        const qrSyncUpcomingValue = $("#qrSyncUpcomingValue");
+        const qrSyncNameCountRange = $("#qrSyncNameCountRange");
+        const qrSyncNameCountValue = $("#qrSyncNameCountValue");
+        const qrSyncNameCharsRange = $("#qrSyncNameCharsRange");
+        const qrSyncNameCharsValue = $("#qrSyncNameCharsValue");
         const qrSyncGuardRange = $("#qrSyncGuardRange");
         const qrSyncGuardValue = $("#qrSyncGuardValue");
         const cyclePhaseValue = $("#cyclePhaseValue");
@@ -1887,6 +1920,9 @@
 
         function syncQrSettingsUi() {
             qrSyncGuardValue.textContent = formatQrDelay(qrSyncGuardRange.value);
+            qrSyncUpcomingValue.textContent = String(Number(qrSyncUpcomingRange.value || 0));
+            qrSyncNameCountValue.textContent = String(Number(qrSyncNameCountRange.value || 0));
+            qrSyncNameCharsValue.textContent = String(Number(qrSyncNameCharsRange.value || 0));
         }
 
         function formatCm(value) {
@@ -2119,6 +2155,9 @@
             if (!isFieldActive(speedRange)) updateSpeedLabel(state.speed_duty);
             qrSyncEnabledInput.checked = state.qr_sync_enabled !== false;
             qrSyncDebugInput.checked = state.qr_sync_debug_enabled === true;
+            syncFieldValue(qrSyncUpcomingRange, state.qr_sync_upcoming_count ?? 2);
+            syncFieldValue(qrSyncNameCountRange, state.qr_sync_name_count ?? 1);
+            syncFieldValue(qrSyncNameCharsRange, state.qr_sync_name_chars ?? 32);
             syncFieldValue(qrSyncGuardRange, state.qr_sync_guard_sec ?? DEFAULT_QR_GUARD_SEC);
             syncQrSettingsUi();
             syncFieldValue(pauseExtendInput, state.cycle_pause_extend_sec);
@@ -2544,6 +2583,33 @@
         qrSyncDebugInput.addEventListener("change", () => {
             holdFormSync();
             pushSettings({ qr_sync_debug_enabled: qrSyncDebugInput.checked }).catch(() => {});
+        });
+
+        qrSyncUpcomingRange.addEventListener("input", () => {
+            holdFormSync();
+            syncQrSettingsUi();
+        });
+        qrSyncUpcomingRange.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_upcoming_count: Number(qrSyncUpcomingRange.value) }).catch(() => {});
+        });
+
+        qrSyncNameCountRange.addEventListener("input", () => {
+            holdFormSync();
+            syncQrSettingsUi();
+        });
+        qrSyncNameCountRange.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_name_count: Number(qrSyncNameCountRange.value) }).catch(() => {});
+        });
+
+        qrSyncNameCharsRange.addEventListener("input", () => {
+            holdFormSync();
+            syncQrSettingsUi();
+        });
+        qrSyncNameCharsRange.addEventListener("change", () => {
+            holdFormSync();
+            pushSettings({ qr_sync_name_chars: Number(qrSyncNameCharsRange.value) }).catch(() => {});
         });
 
         qrSyncGuardRange.addEventListener("input", () => {
