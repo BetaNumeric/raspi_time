@@ -75,6 +75,13 @@ If you want it to auto-start at login too:
 ./install_pi_launchers.sh --autostart
 ```
 
+To have cycle mode start automatically after login, save the startup cycle flag
+into the autostart launcher. The default delay is 120 seconds:
+
+```bash
+TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_pi_launchers.sh --autostart
+```
+
 If the boot service is already running, the launcher reuses that server and
 passes the desktop session environment to it before starting MPV. This matters
 because a boot-time systemd service normally does not know `DISPLAY`,
@@ -109,6 +116,13 @@ use a hardware manual control path or a dedicated motor controller.
 
 The boot service uses required GPIO mode, so it will retry through systemd
 instead of quietly running without switch/motor access.
+
+To have the boot service start cycle mode automatically after a 2-minute initial
+delay, install it with:
+
+```bash
+sudo env TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_boot_service.sh
+```
 
 ## 2. Auto-launch the fullscreen monitor output
 

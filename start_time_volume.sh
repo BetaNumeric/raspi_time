@@ -14,6 +14,8 @@ HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
 DISPLAY_BACKEND="${TIME_VOLUME_DISPLAY_BACKEND:-mpv}"
 DISPLAY_PATH="${TIME_VOLUME_DISPLAY_PATH:-/display}"
+AUTO_START_CYCLE="${TIME_VOLUME_AUTO_START_CYCLE:-}"
+AUTO_START_CYCLE_DELAY_SEC="${TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC:-120}"
 DEFAULT_CAMERA_URL="https://betanumeric.github.io/volumetric_time_camera/"
 if [[ -n "${TIME_VOLUME_CAMERA_URL+x}" ]]; then
     CAMERA_URL="$TIME_VOLUME_CAMERA_URL"
@@ -134,6 +136,39 @@ start_mpv_display_with_retries() {
     return 1
 }
 
+auto_start_cycle_enabled() {
+    case "${AUTO_START_CYCLE,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+start_cycle_countdown() {
+    python3 - "$PORT" "$AUTO_START_CYCLE_DELAY_SEC" <<'PY'
+import json
+import sys
+import urllib.request
+
+port = sys.argv[1]
+delay = sys.argv[2]
+url = f"http://127.0.0.1:{port}/api/action"
+payload = json.dumps({
+    "action": "cycle_start_countdown",
+    "seconds": delay,
+}).encode("utf-8")
+request = urllib.request.Request(
+    url,
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+
+with urllib.request.urlopen(request, timeout=5.0) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+PY
+}
+
 start_server() {
     if server_is_healthy; then
         return 0
@@ -241,6 +276,13 @@ if wait_for_server; then
         fi
     elif [[ "$DISPLAY_BACKEND" != "none" ]]; then
         launch_browser
+    fi
+    if auto_start_cycle_enabled; then
+        if start_cycle_countdown; then
+            echo "Cycle auto-start countdown set for ${AUTO_START_CYCLE_DELAY_SEC}s."
+        else
+            echo "Server is running, but the cycle auto-start countdown could not be set."
+        fi
     fi
     print_urls
 else

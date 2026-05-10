@@ -56,6 +56,20 @@ asks that live server to start MPV and passes the desktop session environment
 with the request. That lets a boot-managed server open MPV after login without
 replacing the early switch-polling process.
 
+To have cycle mode start automatically after the server starts, enable the
+startup cycle flag. The default startup delay is 120 seconds:
+
+```bash
+TIME_VOLUME_AUTO_START_CYCLE=1 ./start_time_volume.sh
+```
+
+For desktop autostart, pass the flag while creating the launcher so it is saved
+into the autostart desktop file:
+
+```bash
+TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_pi_launchers.sh --autostart
+```
+
 Autostart output is logged to:
 
 ```text
@@ -156,6 +170,13 @@ The boot service requires GPIO access. If GPIO is unavailable, systemd will keep
 retrying instead of starting in simulation mode. By default, this service starts
 only the actuator server; the desktop launcher/autostart can then enable the MPV
 display once the graphical session is available.
+
+To make the boot service start cycle mode automatically after its initial
+2-minute delay:
+
+```bash
+sudo env TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_boot_service.sh
+```
 
 ## Runtime Files
 

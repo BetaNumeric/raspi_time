@@ -104,6 +104,8 @@ QR_SYNC_DEFAULT_NAME_CHARS = 32
 QR_SYNC_MAX_NAME_CHARS = 64
 MPV_DEFAULT_FPS_CAP = 30.0
 DEFAULT_DISPLAY_BACKEND = "mpv"
+AUTO_START_CYCLE_ON_BOOT_DEFAULT = False
+AUTO_START_CYCLE_DELAY_SEC_DEFAULT = 120.0
 MPV_IPC_PATH = RUN_DIR / "time_volume_mpv.sock"
 MPV_PID_FILE = RUN_DIR / "time_volume_mpv.pid"
 MPV_BLACK_IMAGE = RUN_DIR / "mpv_black.png"
@@ -127,6 +129,20 @@ MPV_DISPLAY_ENV_KEYS = {
     "XDG_SESSION_DESKTOP",
     "XDG_SESSION_TYPE",
 }
+
+_auto_start_cycle_env = os.environ.get("TIME_VOLUME_AUTO_START_CYCLE")
+AUTO_START_CYCLE_ON_BOOT = (
+    AUTO_START_CYCLE_ON_BOOT_DEFAULT
+    if _auto_start_cycle_env is None
+    else _auto_start_cycle_env.strip().lower() in {"1", "true", "yes", "on"}
+)
+try:
+    AUTO_START_CYCLE_DELAY_SEC = max(
+        0.0,
+        float(os.environ.get("TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC", AUTO_START_CYCLE_DELAY_SEC_DEFAULT)),
+    )
+except (TypeError, ValueError):
+    AUTO_START_CYCLE_DELAY_SEC = AUTO_START_CYCLE_DELAY_SEC_DEFAULT
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -652,8 +668,8 @@ class InstallationController:
         self.target_pct = 0.0
         self.delay_sec = 0
         self.speed_duty = 1.0
-        self.cycle_pause_extend_sec = 2.0
-        self.cycle_pause_retract_sec = 2.0
+        self.cycle_pause_extend_sec = 60.0
+        self.cycle_pause_retract_sec = 60.0
         self.cycle_random = False
         self.cycle_order_ids: list[str] = []
         self.cycle_disabled_ids: set[str] = set()
@@ -2216,6 +2232,9 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.home()
             elif action == "cycle_toggle":
                 controller.toggle_cycle()
+            elif action == "cycle_start_countdown":
+                seconds = max(0.0, coerce_float(payload.get("seconds"), AUTO_START_CYCLE_DELAY_SEC))
+                controller.start_countdown(seconds, action="cycle")
             elif action == "qr_sync_toggle":
                 controller.toggle_qr_sync_display()
             elif action == "jog_start":
@@ -3032,6 +3051,10 @@ def main() -> None:
             controller.set_display_backend_status("browser", "MPV display unavailable; use /display")
     elif args.display_backend == "none":
         controller.set_display_backend_status("none", "No fullscreen display backend")
+
+    if AUTO_START_CYCLE_ON_BOOT:
+        controller.start_countdown(AUTO_START_CYCLE_DELAY_SEC, action="cycle")
+        print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
 
     server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
 
