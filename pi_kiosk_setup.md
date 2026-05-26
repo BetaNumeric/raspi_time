@@ -117,11 +117,13 @@ use a hardware manual control path or a dedicated motor controller.
 The boot service uses required GPIO mode, so it will retry through systemd
 instead of quietly running without switch/motor access.
 
-To have the boot service start cycle mode automatically after a 2-minute initial
-delay, install it with:
+Keep the boot service focused on the actuator server. The exhibition countdown
+should be started by the desktop launcher after MPV has opened, so the monitor
+shows the QR/countdown for the full startup delay. If you previously installed
+the service with auto-start cycle environment variables, reinstall it cleanly:
 
 ```bash
-sudo env TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_boot_service.sh
+sudo ./install_boot_service.sh
 ```
 
 ## 2. Auto-launch the fullscreen monitor output
@@ -141,6 +143,11 @@ That installs a desktop-session autostart entry at:
 The entry runs `start_time_volume_autostart.sh`, which waits briefly for the
 graphical session, starts or reuses the controller server, and retries the MPV
 fullscreen display startup.
+
+Keep the boot service on `TIME_VOLUME_DISPLAY_BACKEND=none` and let the desktop
+autostart open MPV. A boot-time service starts before the graphical session has
+stable `DISPLAY`/`WAYLAND_DISPLAY` values, which can leave MPV on a black
+window or create a second window when the desktop launcher starts later.
 
 ## Why this setup
 

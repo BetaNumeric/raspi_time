@@ -6,16 +6,20 @@ RUN_DIR="$SCRIPT_DIR/.run"
 PID_FILE="$RUN_DIR/time_volume_server.pid"
 BROWSER_PID_FILE="$RUN_DIR/time_volume_browser.pid"
 MPV_PID_FILE="$RUN_DIR/time_volume_mpv.pid"
+START_LOCK_FILE="$RUN_DIR/time_volume_start.lock"
 LOG_FILE="$RUN_DIR/time_volume_server.log"
+SERVICE_NAME="${TIME_VOLUME_SERVICE_NAME:-time-volume.service}"
 MPV_START_RETRIES="${TIME_VOLUME_MPV_START_RETRIES:-30}"
 MPV_START_RETRY_DELAY="${TIME_VOLUME_MPV_START_RETRY_DELAY:-1}"
 
 HOST="${TIME_VOLUME_HOST:-0.0.0.0}"
 PORT="${TIME_VOLUME_PORT:-8000}"
 DISPLAY_BACKEND="${TIME_VOLUME_DISPLAY_BACKEND:-mpv}"
+SERVER_DISPLAY_BACKEND="${TIME_VOLUME_SERVER_DISPLAY_BACKEND:-none}"
 DISPLAY_PATH="${TIME_VOLUME_DISPLAY_PATH:-/display}"
 AUTO_START_CYCLE="${TIME_VOLUME_AUTO_START_CYCLE:-}"
 AUTO_START_CYCLE_DELAY_SEC="${TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC:-120}"
+BOOT_SERVICE_WAIT_SECONDS="${TIME_VOLUME_BOOT_SERVICE_WAIT_SECONDS:-60}"
 DEFAULT_CAMERA_URL="https://betanumeric.github.io/volumetric_time_camera/"
 if [[ -n "${TIME_VOLUME_CAMERA_URL+x}" ]]; then
     CAMERA_URL="$TIME_VOLUME_CAMERA_URL"
@@ -27,11 +31,24 @@ HEALTH_URL="http://127.0.0.1:${PORT}/api/state"
 
 mkdir -p "$RUN_DIR"
 
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$START_LOCK_FILE"
+    flock 9
+fi
+
 case "$DISPLAY_BACKEND" in
     browser|mpv|none) ;;
     *)
         echo "Unknown display backend '$DISPLAY_BACKEND'; falling back to browser."
         DISPLAY_BACKEND="browser"
+        ;;
+esac
+
+case "$SERVER_DISPLAY_BACKEND" in
+    browser|mpv|none) ;;
+    *)
+        echo "Unknown server display backend '$SERVER_DISPLAY_BACKEND'; using none."
+        SERVER_DISPLAY_BACKEND="none"
         ;;
 esac
 
@@ -69,6 +86,53 @@ try:
         raise SystemExit(0 if response.status == 200 else 1)
 except Exception:
     raise SystemExit(1)
+PY
+}
+
+server_port_is_open() {
+    python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.5):
+        raise SystemExit(0)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+boot_service_installed() {
+    if command -v systemctl >/dev/null 2>&1; then
+        local service_state
+        service_state="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+        case "$service_state" in
+            enabled|enabled-runtime|static|alias|linked|linked-runtime|indirect) return 0 ;;
+            disabled|masked) return 1 ;;
+        esac
+    fi
+    [[ -f /etc/systemd/system/time-volume.service || -f /lib/systemd/system/time-volume.service ]]
+}
+
+wait_for_existing_server() {
+    local wait_seconds="$1"
+    python3 - "$HEALTH_URL" "$wait_seconds" <<'PY'
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1]
+deadline = time.time() + max(0.0, float(sys.argv[2]))
+
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=2.0) as response:
+            if response.status == 200:
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(0.5)
+
+raise SystemExit(1)
 PY
 }
 
@@ -155,6 +219,7 @@ url = f"http://127.0.0.1:{port}/api/action"
 payload = json.dumps({
     "action": "cycle_start_countdown",
     "seconds": delay,
+    "remember_delay": True,
 }).encode("utf-8")
 request = urllib.request.Request(
     url,
@@ -174,6 +239,16 @@ start_server() {
         return 0
     fi
 
+    if boot_service_installed; then
+        if wait_for_existing_server "$BOOT_SERVICE_WAIT_SECONDS"; then
+            return 0
+        fi
+    fi
+
+    if server_port_is_open; then
+        return 0
+    fi
+
     if [[ -f "$PID_FILE" ]]; then
         local existing_pid
         existing_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -182,7 +257,7 @@ start_server() {
         fi
     fi
 
-    nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" --display-backend "$DISPLAY_BACKEND" >>"$LOG_FILE" 2>&1 &
+    TIME_VOLUME_AUTO_START_CYCLE=0 nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" --display-backend "$SERVER_DISPLAY_BACKEND" >>"$LOG_FILE" 2>&1 &
     echo "$!" > "$PID_FILE"
 }
 

@@ -28,6 +28,23 @@ plays over the full 0-48 cm stroke. With the example above, the sequence plays
 from 0-32 cm and the display is black outside that span. For videos, use a JSON
 sidecar with the same base name as the clip, such as `clip.json` for `clip.mp4`.
 
+## Updating Media
+
+For the most reliable updates, copy new or replacement folders into `media/`
+with a temporary name first, then rename them when the copy is complete:
+
+```bash
+cp -a ~/new-content/apple media/apple.incoming
+mv media/apple media/apple.old
+mv media/apple.incoming media/apple
+```
+
+After that, tap **Refresh Library** in the controller. The scanner ignores
+hidden names and names ending in `.incoming`, `.partial`, `.tmp`, or `.copying`,
+so partially copied folders do not appear as playable sequences. Same-name
+replacements are also detected by file size/modified-time signatures so MPV
+does not keep using an old image playlist for a replaced folder.
+
 ## Run
 
 ```bash
@@ -56,8 +73,9 @@ asks that live server to start MPV and passes the desktop session environment
 with the request. That lets a boot-managed server open MPV after login without
 replacing the early switch-polling process.
 
-To have cycle mode start automatically after the server starts, enable the
-startup cycle flag. The default startup delay is 120 seconds:
+To have cycle mode start automatically after the fullscreen display is open,
+enable the startup cycle flag on the launcher. The default startup delay is 120
+seconds:
 
 ```bash
 TIME_VOLUME_AUTO_START_CYCLE=1 ./start_time_volume.sh
@@ -171,11 +189,18 @@ retrying instead of starting in simulation mode. By default, this service starts
 only the actuator server; the desktop launcher/autostart can then enable the MPV
 display once the graphical session is available.
 
-To make the boot service start cycle mode automatically after its initial
-2-minute delay:
+Keep the boot service display backend as `none` unless you are debugging. The
+fullscreen MPV window should be owned by the desktop launcher/autostart, because
+boot-time services usually start before the graphical desktop environment is
+ready.
+
+Do not put the exhibition auto-start countdown on the boot service. The launcher
+waits for the boot service, opens MPV from the desktop session, resets the
+controller delay to the requested startup value, and then starts the countdown.
+If you previously installed the service with `TIME_VOLUME_AUTO_START_CYCLE`, run:
 
 ```bash
-sudo env TIME_VOLUME_AUTO_START_CYCLE=1 TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=120 ./install_boot_service.sh
+sudo ./install_boot_service.sh
 ```
 
 ## Runtime Files

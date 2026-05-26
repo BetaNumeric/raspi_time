@@ -59,8 +59,8 @@ LPWM = 19
 REN = 23
 LEN = 24
 PWM_HZ = 200
-EXTEND_SEC = 23.75
-RETRACT_SEC = 22.0
+EXTEND_SEC = 21.4
+RETRACT_SEC = 21.45
 HOME_TIMEOUT_SEC = 25.0
 LIFT_STROKE_CM = 48.0
 MIN_SEQUENCE_HEIGHT_CM = 0.01
@@ -89,6 +89,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
+MEDIA_IMPORT_TEMP_SUFFIXES = (".partial", ".tmp", ".incoming", ".copying")
 QR_SYNC_DEFAULT_GUARD_SEC = 5.0
 QR_SYNC_SETTINGS_VERSION = 4
 QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
@@ -182,6 +183,13 @@ def sequence_travel_duration_sec(sequence: "SequenceItem", direction: int, duty:
     return ((height_cm / LIFT_STROKE_CM) * stroke_sec) / effective_duty
 
 
+def lift_motion_duration_sec(direction: int, duty: float, travel_pct: float = 100.0) -> float:
+    stroke_sec = EXTEND_SEC if direction >= 0 else RETRACT_SEC
+    effective_duty = clamp(duty, 0.1, 1.0)
+    travel_fraction = clamp(abs(travel_pct), 0.0, 100.0) / 100.0
+    return max(0.0, (travel_fraction * stroke_sec) / effective_duty)
+
+
 def frame_stride_for_sequence(sequence: "SequenceItem", direction: int, duty: float, fps_cap: float) -> tuple[int, float, float]:
     if sequence.kind != "images" or sequence.frame_count <= 1:
         return 1, 0.0, 0.0
@@ -260,6 +268,7 @@ class SequenceItem:
     frame_count: int = 0
     frame_paths: list[str] = field(default_factory=list)
     media_url: str | None = None
+    content_signature: str = ""
     start_cm: float = 0.0
     volume_height_cm: float = LIFT_STROKE_CM
     outside_playback: str = "black"
@@ -296,6 +305,7 @@ class SequenceItem:
             "relative_path": self.relative_path,
             "frame_count": self.frame_count,
             "media_url": self.media_url,
+            "content_signature": self.content_signature,
             "lift_stroke_cm": LIFT_STROKE_CM,
             "start_cm": round(self.start_cm, 3),
             "end_cm": round(self.end_cm, 3),
@@ -331,11 +341,31 @@ class SequenceLibrary:
             return {}
         return payload
 
+    def _is_import_temp_name(self, name: str) -> bool:
+        clean = name.strip().lower()
+        return clean.startswith(".") or clean.endswith(MEDIA_IMPORT_TEMP_SUFFIXES)
+
     def _metadata_for_directory(self, directory: Path) -> dict[str, Any]:
         return self._read_metadata(directory / SEQUENCE_METADATA_FILENAME)
 
     def _metadata_for_video(self, file_path: Path) -> dict[str, Any]:
         return self._read_metadata(file_path.with_suffix(".json"))
+
+    def _signature_for_paths(self, paths: list[Path]) -> str:
+        digest = hashlib.sha1()
+        for path in sorted(paths, key=lambda item: item.relative_to(self.root).as_posix()):
+            try:
+                stat = path.stat()
+                rel_path = path.relative_to(self.root).as_posix()
+            except OSError:
+                continue
+            digest.update(rel_path.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b":")
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()[:16]
 
     def _sequence_span(self, metadata: dict[str, Any]) -> tuple[float, float, str]:
         height_value = metadata.get(
@@ -368,6 +398,7 @@ class SequenceLibrary:
         items: dict[str, SequenceItem] = {}
 
         for current_dir, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [name for name in dirnames if not self._is_import_temp_name(name)]
             dirnames.sort()
             directory = Path(current_dir)
             directory_resolved = directory.resolve()
@@ -375,11 +406,17 @@ class SequenceLibrary:
             image_paths: list[str] = []
 
             for name in sorted(filenames):
+                if self._is_import_temp_name(name):
+                    continue
                 file_path = directory / name
                 suffix = file_path.suffix.lower()
                 rel_path = file_path.relative_to(self.root).as_posix()
 
                 if suffix in VIDEO_EXTENSIONS:
+                    signature_paths = [file_path]
+                    metadata_path = file_path.with_suffix(".json")
+                    if metadata_path.is_file():
+                        signature_paths.append(metadata_path)
                     start_cm, height_cm, outside_playback = self._sequence_span(
                         self._metadata_for_video(file_path)
                     )
@@ -389,6 +426,7 @@ class SequenceLibrary:
                         kind="video",
                         relative_path=rel_path,
                         media_url=media_url_for(rel_path),
+                        content_signature=self._signature_for_paths(signature_paths),
                         start_cm=start_cm,
                         volume_height_cm=height_cm,
                         outside_playback=outside_playback,
@@ -401,6 +439,10 @@ class SequenceLibrary:
 
             sequence_id = rel_dir or "__root__"
             display_name = directory.name if rel_dir else "media"
+            signature_paths = [self.root / relative_path for relative_path in image_paths]
+            metadata_path = directory / SEQUENCE_METADATA_FILENAME
+            if metadata_path.is_file():
+                signature_paths.append(metadata_path)
             start_cm, height_cm, outside_playback = self._sequence_span(
                 self._metadata_for_directory(directory)
             )
@@ -411,6 +453,7 @@ class SequenceLibrary:
                 relative_path=rel_dir or ".",
                 frame_count=len(image_paths),
                 frame_paths=image_paths,
+                content_signature=self._signature_for_paths(signature_paths),
                 start_cm=start_cm,
                 volume_height_cm=height_cm,
                 outside_playback=outside_playback,
@@ -1028,8 +1071,38 @@ class InstallationController:
         rounded = int(math.floor(max(0, sequence_start_in_ms) / quantum) * quantum)
         return max(0, rounded - QR_SYNC_CAPTURE_START_LEAD_MS)
 
-    def _qr_sync_capture_duration_ms(self, sequence_start_in_ms: int, capture_start_in_ms: int, sequence_duration_ms: int, state: dict[str, Any]) -> int:
-        return int(sequence_duration_ms + max(0, sequence_start_in_ms - capture_start_in_ms) + self._qr_sync_capture_stop_padding_ms(state))
+    def _qr_sync_capture_duration_ms(self, motion_start_in_ms: int, capture_start_in_ms: int, motion_duration_ms: int, state: dict[str, Any]) -> int:
+        return int(motion_duration_ms + max(0, motion_start_in_ms - capture_start_in_ms) + self._qr_sync_capture_stop_padding_ms(state))
+
+    def _qr_sync_motion_travel_pct(self, state: dict[str, Any], direction: int) -> float:
+        position_pct = clamp(coerce_float(state.get("position_pct"), 0.0), 0.0, 100.0)
+        target_pct: float | None = None
+
+        phase = state.get("cycle_pause_phase")
+        if phase == "top":
+            target_pct = 0.0
+        elif phase == "bottom":
+            target_pct = 100.0
+        elif state.get("countdown_deadline_ms") is not None and state.get("countdown_action") == "cycle":
+            target_pct = 100.0
+        else:
+            active_target = state.get("active_target_pct")
+            if isinstance(active_target, (int, float)):
+                target_pct = clamp(float(active_target), 0.0, 100.0)
+            elif state.get("countdown_deadline_ms") is not None:
+                target_pct = clamp(coerce_float(state.get("target_pct"), position_pct), 0.0, 100.0)
+
+        if target_pct is not None:
+            return abs(target_pct - position_pct)
+
+        return 100.0 if direction in {-1, 1} else 0.0
+
+    def _qr_sync_motion_duration_ms(self, state: dict[str, Any], direction: int) -> int | None:
+        if direction not in {-1, 1}:
+            return None
+        duty = float(state.get("speed_duty") or 1.0)
+        travel_pct = self._qr_sync_motion_travel_pct(state, direction)
+        return int(round(lift_motion_duration_sec(direction, duty, travel_pct) * 1000))
 
     def _qr_sync_upcoming_entries(
         self,
@@ -1062,8 +1135,8 @@ class InstallationController:
             if not sequence:
                 break
 
-            sequence_duration_ms = int(round(sequence_travel_duration_sec(sequence, direction, duty) * 1000))
-            sequence_end_in_ms = sequence_start_in_ms + sequence_duration_ms
+            motion_duration_ms = int(round(lift_motion_duration_sec(direction, duty) * 1000))
+            sequence_end_in_ms = sequence_start_in_ms + motion_duration_ms
             pause_after_sec = state.get("cycle_pause_extend_sec") if direction > 0 else state.get("cycle_pause_retract_sec")
             pause_after_ms = int(round(coerce_float(pause_after_sec, 0.0) * 1000))
             next_start_in_ms = sequence_end_in_ms + max(0, pause_after_ms)
@@ -1081,7 +1154,7 @@ class InstallationController:
             capture_start_in_ms = self._qr_sync_capture_start_offset_ms(next_start_in_ms)
             if capture_start_in_ms is None:
                 break
-            next_duration_ms = int(round(sequence_travel_duration_sec(next_sequence, next_direction, duty) * 1000))
+            next_duration_ms = int(round(lift_motion_duration_sec(next_direction, duty) * 1000))
             capture_duration_ms = self._qr_sync_capture_duration_ms(next_start_in_ms, capture_start_in_ms, next_duration_ms, state)
             entry: list[Any] = [
                 int(capture_start_in_ms),
@@ -1160,7 +1233,7 @@ class InstallationController:
             duration_ms = None
             if sequence:
                 duration_direction = direction if direction in {-1, 1} else 1
-                duration_ms = int(round(sequence_travel_duration_sec(sequence, duration_direction, float(state.get("speed_duty") or 1.0)) * 1000))
+                duration_ms = self._qr_sync_motion_duration_ms(state, duration_direction)
                 label = sequence.name
             payload_duration_ms = duration_ms
             if duration_ms is not None and start_in_ms is not None and payload_start_in_ms is not None:
@@ -1536,7 +1609,24 @@ class InstallationController:
         with self.state_lock:
             return self.countdown_deadline is not None
 
-    def start_countdown(self, seconds: int, action: str = "movement") -> None:
+    def start_cycle_countdown(self, seconds: float, remember_delay: bool = False) -> None:
+        delay_seconds = max(0.0, float(seconds))
+        if remember_delay:
+            with self.state_lock:
+                self.delay_sec = max(0, int(round(delay_seconds)))
+            self._save_settings()
+
+        with self.state_lock:
+            if self.is_cycling:
+                return
+
+        with self.hardware.lock:
+            if self.hardware.is_moving:
+                return
+
+        self.start_countdown(delay_seconds, action="cycle")
+
+    def start_countdown(self, seconds: float, action: str = "movement") -> None:
         self.cancel_countdown()
         if seconds <= 0:
             if action == "cycle":
@@ -2234,7 +2324,7 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.toggle_cycle()
             elif action == "cycle_start_countdown":
                 seconds = max(0.0, coerce_float(payload.get("seconds"), AUTO_START_CYCLE_DELAY_SEC))
-                controller.start_countdown(seconds, action="cycle")
+                controller.start_cycle_countdown(seconds, remember_delay=bool(payload.get("remember_delay", False)))
             elif action == "qr_sync_toggle":
                 controller.toggle_qr_sync_display()
             elif action == "jog_start":
@@ -2548,6 +2638,7 @@ class MpvDisplayBackend:
         self._write_black_image()
 
         try:
+            self._terminate_existing_mpv_processes()
             if MPV_IPC_PATH.exists():
                 MPV_IPC_PATH.unlink()
         except Exception:
@@ -2585,6 +2676,49 @@ class MpvDisplayBackend:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         return True
+
+    def _our_mpv_pids(self) -> list[int]:
+        pids: list[int] = []
+        proc_root = Path("/proc")
+        if not proc_root.exists():
+            return pids
+
+        for proc_dir in proc_root.iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            try:
+                cmdline = (proc_dir / "cmdline").read_bytes().decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if str(MPV_IPC_PATH) in cmdline:
+                pids.append(int(proc_dir.name))
+        return pids
+
+    def _terminate_mpv_pid(self, pid: int) -> None:
+        if self.process and self.process.pid == pid:
+            return
+        try:
+            os.kill(pid, 15)
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, 9)
+        except Exception:
+            pass
+
+    def _terminate_existing_mpv_processes(self) -> None:
+        for pid in self._our_mpv_pids():
+            self._terminate_mpv_pid(pid)
+
+        try:
+            MPV_PID_FILE.unlink()
+        except Exception:
+            pass
 
     def _process_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -2809,7 +2943,8 @@ class MpvDisplayBackend:
         frame_count = max(1, len(indexes))
         fps = clamp((frame_count - 1) / max(0.01, duration_sec), 0.1, self.fps_cap)
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.id)[:80] or "sequence"
-        playlist_path = self.playlist_dir / f"{safe_id}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
+        content_signature = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.content_signature or "nosig")[:24]
+        playlist_path = self.playlist_dir / f"{safe_id}_{content_signature}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
 
         if not playlist_path.exists():
             playlist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2820,7 +2955,7 @@ class MpvDisplayBackend:
             playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         return {
-            "key": ("images", sequence.id, direction, stride, sequence.frame_count, round(fps, 3)),
+            "key": ("images", sequence.id, sequence.content_signature, direction, stride, sequence.frame_count, round(fps, 3)),
             "source": f"mf://@{playlist_path}",
             "options": {"mf-fps": f"{fps:.6f}"},
             "duration_sec": duration_sec,
@@ -2888,11 +3023,12 @@ class MpvDisplayBackend:
 
         duty = float(state.get("speed_duty") or 1.0)
         travel_duration = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
-        target_time = clamp(ratio, 0.0, 1.0) * duration
+        playback_ratio = ratio if direction >= 0 else 1.0 - ratio
+        target_time = clamp(playback_ratio, 0.0, 1.0) * duration
 
-        if not moving or direction < 0:
+        if not moving:
             self._set_pause(True)
-            self._seek(target_time, force=not moving)
+            self._seek(target_time, force=True)
             return
 
         self._set_speed(duration / travel_duration)
@@ -3053,7 +3189,7 @@ def main() -> None:
         controller.set_display_backend_status("none", "No fullscreen display backend")
 
     if AUTO_START_CYCLE_ON_BOOT:
-        controller.start_countdown(AUTO_START_CYCLE_DELAY_SEC, action="cycle")
+        controller.start_cycle_countdown(AUTO_START_CYCLE_DELAY_SEC, remember_delay=True)
         print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
 
     server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)

@@ -10,8 +10,8 @@ PORT="${TIME_VOLUME_PORT:-8000}"
 CAMERA_URL="${TIME_VOLUME_CAMERA_URL:-}"
 CAMERA_DIR="${TIME_VOLUME_CAMERA_DIR:-}"
 DISPLAY_BACKEND="${TIME_VOLUME_DISPLAY_BACKEND:-none}"
-AUTO_START_CYCLE="${TIME_VOLUME_AUTO_START_CYCLE:-}"
-AUTO_START_CYCLE_DELAY_SEC="${TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC:-}"
+SERVICE_AUTO_START_CYCLE="${TIME_VOLUME_SERVICE_AUTO_START_CYCLE:-}"
+SERVICE_AUTO_START_CYCLE_DELAY_SEC="${TIME_VOLUME_SERVICE_AUTO_START_CYCLE_DELAY_SEC:-}"
 
 case "$DISPLAY_BACKEND" in
     browser|mpv|none) ;;
@@ -68,12 +68,12 @@ if [[ -n "$CAMERA_DIR" ]]; then
     printf 'Environment="TIME_VOLUME_CAMERA_DIR=%s"\n' "$CAMERA_DIR" >> "$SERVICE_PATH"
 fi
 
-if [[ -n "$AUTO_START_CYCLE" ]]; then
-    printf 'Environment="TIME_VOLUME_AUTO_START_CYCLE=%s"\n' "$AUTO_START_CYCLE" >> "$SERVICE_PATH"
+if [[ -n "$SERVICE_AUTO_START_CYCLE" ]]; then
+    printf 'Environment="TIME_VOLUME_AUTO_START_CYCLE=%s"\n' "$SERVICE_AUTO_START_CYCLE" >> "$SERVICE_PATH"
 fi
 
-if [[ -n "$AUTO_START_CYCLE_DELAY_SEC" ]]; then
-    printf 'Environment="TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=%s"\n' "$AUTO_START_CYCLE_DELAY_SEC" >> "$SERVICE_PATH"
+if [[ -n "$SERVICE_AUTO_START_CYCLE_DELAY_SEC" ]]; then
+    printf 'Environment="TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC=%s"\n' "$SERVICE_AUTO_START_CYCLE_DELAY_SEC" >> "$SERVICE_PATH"
 fi
 
 cat >> "$SERVICE_PATH" <<EOF
@@ -87,3 +87,7 @@ systemctl enable --now "$SERVICE_NAME"
 echo "Installed and started $SERVICE_NAME."
 echo "Switch control will become available after the Pi has booted and this service starts."
 echo "Check status with: systemctl status $SERVICE_NAME"
+if [[ -n "${TIME_VOLUME_AUTO_START_CYCLE:-}" || -n "${TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC:-}" ]]; then
+    echo "Note: TIME_VOLUME_AUTO_START_CYCLE is ignored by the boot service installer."
+    echo "Use install_pi_launchers.sh --autostart for the 120s display-ready cycle countdown."
+fi
