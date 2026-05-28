@@ -726,6 +726,7 @@ class InstallationController:
 
         self.countdown_deadline: float | None = None
         self.countdown_event: threading.Event | None = None
+        self.countdown_token = 0
         self.countdown_action = "movement"
         self.cycle_pause_phase: str | None = None
         self.cycle_pause_deadline: float | None = None
@@ -1637,12 +1638,14 @@ class InstallationController:
         event = threading.Event()
         deadline = time.time() + seconds
         with self.state_lock:
+            self.countdown_token += 1
+            token = self.countdown_token
             self.countdown_deadline = deadline
             self.countdown_event = event
             self.countdown_action = action if action in {"movement", "cycle"} else "movement"
-        threading.Thread(target=self._countdown_worker, args=(event,), daemon=True).start()
+        threading.Thread(target=self._countdown_worker, args=(event, token), daemon=True).start()
 
-    def _countdown_worker(self, event: threading.Event) -> None:
+    def _countdown_worker(self, event: threading.Event, token: int) -> None:
         while not event.is_set():
             with self.state_lock:
                 deadline = self.countdown_deadline
@@ -1657,22 +1660,23 @@ class InstallationController:
             return
 
         with self.state_lock:
-            if self.countdown_event is event:
+            if self.countdown_event is event and self.countdown_token == token:
                 action = self.countdown_action
                 self.countdown_event = None
                 self.countdown_deadline = None
                 self.countdown_action = "movement"
             else:
-                action = "movement"
+                return
 
         if action == "cycle":
-            self._start_cycle_from_countdown()
+            self._start_cycle_from_countdown(token)
         else:
-            self.execute_movement()
+            self._execute_movement_from_countdown(token)
 
     def cancel_countdown(self) -> None:
         with self.state_lock:
             event = self.countdown_event
+            self.countdown_token += 1
             self.countdown_event = None
             self.countdown_deadline = None
             self.countdown_action = "movement"
@@ -1754,6 +1758,13 @@ class InstallationController:
         self.hardware.resume()
         token = self._begin_target_movement(target)
         threading.Thread(target=self._move_worker, args=(delta, duty, token), daemon=True).start()
+
+    def _execute_movement_from_countdown(self, countdown_token: int) -> None:
+        with self.command_lock:
+            with self.state_lock:
+                if self.countdown_token != countdown_token or self.countdown_event is not None:
+                    return
+            self.execute_movement()
 
     def restart_movement(self, new_target: float) -> None:
         if self.is_switch_override_active():
@@ -1864,9 +1875,14 @@ class InstallationController:
             self.cycle_thread = cycle_thread
         cycle_thread.start()
 
-    def _start_cycle_from_countdown(self) -> None:
+    def _start_cycle_from_countdown(self, countdown_token: int | None = None) -> None:
         with self.command_lock:
             with self.state_lock:
+                if (
+                    countdown_token is not None
+                    and (self.countdown_token != countdown_token or self.countdown_event is not None)
+                ):
+                    return
                 if self.is_cycling:
                     return
             self._start_cycle_now_locked()
