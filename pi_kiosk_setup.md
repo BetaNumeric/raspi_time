@@ -25,7 +25,6 @@ That creates:
 
 - `Start Time Volume.desktop`
 - `Stop Time Volume.desktop`
-- `Start Time Volume Display.desktop`
 
 on the Pi desktop. Clicking `Start Time Volume.desktop` will:
 
@@ -34,9 +33,10 @@ on the Pi desktop. Clicking `Start Time Volume.desktop` will:
 3. open or restart the fullscreen MPV display
 
 If the controller server is already running, `Start Time Volume.desktop` still
-asks it to restart MPV with the current desktop session environment. Use
-`Start Time Volume Display.desktop` when you only want to reopen the fullscreen
-screen without thinking about the server.
+asks it to restart MPV with the current desktop session environment. Clicking
+`Stop Time Volume.desktop` stops the current motion/cycle and closes MPV, but
+leaves the boot-managed controller server alive so switch control remains
+available.
 
 The same server hosts the phone controller. The camera app is hosted separately
 on GitHub Pages:
@@ -92,12 +92,6 @@ The autostart launcher logs to:
 
 ```text
 .run/time_volume_launcher.log
-```
-
-The screen-only launcher logs to:
-
-```text
-.run/time_volume_display_launcher.log
 ```
 
 ## 1. Start switch control on boot

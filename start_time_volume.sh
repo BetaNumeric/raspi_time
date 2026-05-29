@@ -19,7 +19,7 @@ SERVER_DISPLAY_BACKEND="${TIME_VOLUME_SERVER_DISPLAY_BACKEND:-none}"
 DISPLAY_PATH="${TIME_VOLUME_DISPLAY_PATH:-/display}"
 AUTO_START_CYCLE="${TIME_VOLUME_AUTO_START_CYCLE:-}"
 AUTO_START_CYCLE_DELAY_SEC="${TIME_VOLUME_AUTO_START_CYCLE_DELAY_SEC:-120}"
-BOOT_SERVICE_WAIT_SECONDS="${TIME_VOLUME_BOOT_SERVICE_WAIT_SECONDS:-60}"
+BOOT_SERVICE_WAIT_SECONDS="${TIME_VOLUME_BOOT_SERVICE_WAIT_SECONDS:-8}"
 DEFAULT_CAMERA_URL="https://betanumeric.github.io/volumetric_time_camera/"
 if [[ -n "${TIME_VOLUME_CAMERA_URL+x}" ]]; then
     CAMERA_URL="$TIME_VOLUME_CAMERA_URL"
@@ -112,6 +112,12 @@ boot_service_installed() {
         esac
     fi
     [[ -f /etc/systemd/system/time-volume.service || -f /lib/systemd/system/time-volume.service ]]
+}
+
+start_boot_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    fi
 }
 
 wait_for_existing_server() {
@@ -240,6 +246,7 @@ start_server() {
     fi
 
     if boot_service_installed; then
+        start_boot_service
         if wait_for_existing_server "$BOOT_SERVICE_WAIT_SECONDS"; then
             return 0
         fi

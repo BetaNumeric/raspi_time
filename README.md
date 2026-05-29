@@ -94,12 +94,10 @@ Autostart output is logged to:
 .run/time_volume_launcher.log
 ```
 
-The launcher installer also creates `Start Time Volume Display.desktop`, which
-only opens or restarts the fullscreen MPV display. Its output is logged to:
-
-```text
-.run/time_volume_display_launcher.log
-```
+`Stop Time Volume.desktop` stops the current motion/cycle and closes the
+fullscreen MPV display while leaving the boot-managed controller server alive.
+That keeps the physical switch/control path available and makes the next Start
+quick.
 
 The default display backend is a dedicated fullscreen MPV process. To run the
 monitor through the browser fallback at `/display` instead:
