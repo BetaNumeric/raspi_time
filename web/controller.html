@@ -472,7 +472,7 @@
             height: 18px;
             accent-color: var(--accent);
         }
-        input[type="number"], input[type="text"], select {
+        input[type="number"], input[type="text"], input[type="search"], select {
             width: 100%;
             min-height: 50px;
             border: 1px solid var(--line);
@@ -507,6 +507,30 @@
             grid-template-columns: auto 1fr auto;
             align-items: center;
             gap: 10px;
+        }
+
+        .sequence-search {
+            display: grid;
+            gap: 6px;
+        }
+
+        .sequence-search-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sequence-search-clear {
+            min-width: 50px;
+            min-height: 50px;
+        }
+
+        .sequence-search-meta {
+            min-height: 1.2em;
+            color: var(--muted);
+            font-size: 0.82rem;
+            line-height: 1.2;
         }
 
         .sequence-select,
@@ -712,6 +736,40 @@
         .cycle-timeline {
             display: grid;
             gap: 8px;
+        }
+
+        .cycle-folder {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            min-width: 0;
+            padding: 10px 4px 4px;
+            color: var(--text);
+        }
+
+        .cycle-folder + .cycle-step {
+            margin-top: 0;
+        }
+
+        .cycle-folder-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            font-weight: 850;
+        }
+
+        .cycle-folder-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .cycle-folder-meta {
+            flex: 0 0 auto;
+            color: var(--muted);
+            font-size: 0.82rem;
         }
 
         .cycle-step {
@@ -1259,6 +1317,20 @@
                     <span id="sequenceSummaryValue" class="cycle-fold-summary-meta">-</span>
                 </summary>
                 <div class="cycle-fold-body">
+                    <div class="sequence-search">
+                        <label class="sr-only" for="sequenceSearchInput">Search sequences</label>
+                        <div class="sequence-search-row">
+                            <input id="sequenceSearchInput" type="search" placeholder="Search sequences" autocomplete="off" enterkeyhint="go">
+                            <button id="clearSequenceSearchBtn" type="button" class="icon-button sequence-search-clear" aria-label="Clear sequence search" title="Clear sequence search">
+                                <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                    <path d="M18 6 6 18"></path>
+                                    <path d="M6 6l12 12"></path>
+                                </svg>
+                                <span class="sr-only">Clear sequence search</span>
+                            </button>
+                        </div>
+                        <div id="sequenceSearchMeta" class="sequence-search-meta" aria-live="polite"></div>
+                    </div>
                     <div class="sequence-actions">
                         <button id="prevSequenceBtn" type="button" class="icon-button" aria-label="Previous sequence" title="Previous sequence">
                             <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1453,6 +1525,9 @@
         const enableAllCycleBtn = $("#enableAllCycleBtn");
         const pauseExtendInput = $("#pauseExtendInput");
         const pauseRetractInput = $("#pauseRetractInput");
+        const sequenceSearchInput = $("#sequenceSearchInput");
+        const clearSequenceSearchBtn = $("#clearSequenceSearchBtn");
+        const sequenceSearchMeta = $("#sequenceSearchMeta");
         const sequenceSelect = $("#sequenceSelect");
         const sequenceHeightValue = $("#sequenceHeightValue");
         const sequenceSpanValue = $("#sequenceSpanValue");
@@ -1502,6 +1577,7 @@
         let currentSequence = null;
         let currentSequenceId = null;
         let libraryItems = [];
+        let visibleSequenceSearchIds = [];
         let localCyclePause = null;
         let suppressFormSyncUntil = 0;
         let targetDebounce = null;
@@ -1516,7 +1592,7 @@
         const DEFAULT_EXTEND_SEC = 23.75;
         const DEFAULT_RETRACT_SEC = 22.0;
         const DEFAULT_QR_GUARD_SEC = 5;
-        const MAX_SEQUENCE_PLAYBACK_FPS = 30;
+        const DEFAULT_SEQUENCE_PLAYBACK_FPS_CAP = 0;
         const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 
         function sequenceSpan(sequence) {
@@ -1573,8 +1649,9 @@
                 : Number(state?.retract_sec || DEFAULT_RETRACT_SEC);
             const duty = clamp(Number(state?.speed_duty || 1), 0.1, 1);
             const durationSec = ((heightCm / strokeCm) * Math.max(0.01, strokeSec)) / duty;
-            const requestedFps = (Number(sequence.frame_count) - 1) / Math.max(0.01, durationSec);
-            const stride = Math.max(1, Math.ceil(requestedFps / MAX_SEQUENCE_PLAYBACK_FPS));
+            const requestedFps = Number(sequence.frame_count) / Math.max(0.01, durationSec);
+            const fpsCap = Number(state?.mpv_fps_cap ?? DEFAULT_SEQUENCE_PLAYBACK_FPS_CAP);
+            const stride = fpsCap > 0 ? Math.max(1, Math.ceil(requestedFps / fpsCap)) : 1;
             return {
                 requestedFps,
                 effectiveFps: requestedFps / stride,
@@ -1954,6 +2031,45 @@
             return libraryItems.find((item) => item.id === sequenceId) || null;
         }
 
+        function sequenceDisplayName(item) {
+            if (!item) return "";
+            return item.display_label || item.display_name || item.name || item.id || "";
+        }
+
+        function sequenceFolderLabel(item) {
+            return item?.folder || "Media";
+        }
+
+        function normalizedSequenceSearchTerm() {
+            return String(sequenceSearchInput.value || "").trim().toLowerCase();
+        }
+
+        function sequenceMatchesSearch(item, term) {
+            if (!term) return true;
+            const haystack = [
+                sequenceDisplayName(item),
+                item?.display_name,
+                item?.name,
+                item?.id,
+                item?.folder,
+                item?.kind
+            ].filter(Boolean).join(" ").toLowerCase();
+            return term.split(/\s+/).every((part) => haystack.includes(part));
+        }
+
+        function sequenceSelectHasOption(sequenceId) {
+            if (!sequenceId) return true;
+            return Array.from(sequenceSelect.options).some((option) => option.value === sequenceId);
+        }
+
+        function compareLibraryItems(a, b) {
+            return (
+                sequenceFolderLabel(a).localeCompare(sequenceFolderLabel(b), undefined, { sensitivity: "base" })
+                || sequenceDisplayName(a).localeCompare(sequenceDisplayName(b), undefined, { sensitivity: "base" })
+                || String(a.id || "").localeCompare(String(b.id || ""), undefined, { sensitivity: "base" })
+            );
+        }
+
         function cycleOrderIdsFromState(state = currentState) {
             const libraryIds = libraryItems.map((item) => item.id);
             const validIds = new Set(libraryIds);
@@ -1969,7 +2085,13 @@
             for (const sequenceId of libraryIds) {
                 if (!seen.has(sequenceId)) ordered.push(sequenceId);
             }
-            return ordered;
+            return ordered
+                .map((sequenceId, index) => ({ sequenceId, index, item: libraryItemById(sequenceId) }))
+                .sort((a, b) => (
+                    sequenceFolderLabel(a.item).localeCompare(sequenceFolderLabel(b.item), undefined, { sensitivity: "base" })
+                    || a.index - b.index
+                ))
+                .map((entry) => entry.sequenceId);
         }
 
         function cycleDisabledIdSetFromState(state = currentState) {
@@ -1986,13 +2108,27 @@
         function sequenceNameForId(sequenceId, fallback = "-") {
             if (!sequenceId) return fallback;
             const item = libraryItemById(sequenceId);
-            return item ? item.name : sequenceId;
+            return item ? sequenceDisplayName(item) : sequenceId;
         }
 
         function describeTimelineItem(item) {
             if (!item) return "Missing sequence";
             const kind = item.kind === "images" ? `${item.frame_count || 0} frames` : "video";
             return `${kind} | ${formatSequenceSpan(item)}`;
+        }
+
+        function cycleFolderGroups(orderIds) {
+            const groups = [];
+            for (const sequenceId of orderIds) {
+                const item = libraryItemById(sequenceId);
+                const folder = sequenceFolderLabel(item);
+                const lastGroup = groups[groups.length - 1];
+                if (!lastGroup || lastGroup.folder !== folder) {
+                    groups.push({ folder, ids: [] });
+                }
+                groups[groups.length - 1].ids.push(sequenceId);
+            }
+            return groups;
         }
 
         function renderCyclePanel(state) {
@@ -2014,37 +2150,70 @@
                 return;
             }
 
-            cycleTimeline.innerHTML = orderIds.map((sequenceId, index) => {
-                const item = libraryItemById(sequenceId);
-                const isActive = sequenceId === state.selected_sequence_id;
-                const isPending = sequenceId === pendingId;
-                const isDisabled = disabledIds.has(sequenceId);
-                const classes = [
-                    "cycle-step",
-                    isActive ? "is-active" : "",
-                    isPending ? "is-pending" : "",
-                    isDisabled ? "is-disabled" : ""
-                ].filter(Boolean).join(" ");
-                const tag = isPending
-                    ? "Next"
-                    : (isDisabled ? "Skipped" : (isActive ? "Current" : describeTimelineItem(item)));
-                return `
-                    <div class="${classes}" data-sequence-id="${escapeHtml(sequenceId)}">
-                        <label class="cycle-step-toggle" aria-label="Include ${escapeHtml(item?.name || sequenceId)}">
-                            <input type="checkbox" data-cycle-action="enabled" data-sequence-id="${escapeHtml(sequenceId)}" ${isDisabled ? "" : "checked"}>
+            const groups = cycleFolderGroups(orderIds);
+            const parts = [];
+            let stepIndex = 0;
+            for (const group of groups) {
+                const groupEnabledCount = group.ids.filter((sequenceId) => !disabledIds.has(sequenceId)).length;
+                const groupPartial = groupEnabledCount > 0 && groupEnabledCount < group.ids.length;
+                parts.push(`
+                    <div class="cycle-folder" data-folder="${escapeHtml(group.folder)}">
+                        <label class="cycle-folder-toggle" aria-label="Include folder ${escapeHtml(group.folder)}">
+                            <input
+                                type="checkbox"
+                                data-cycle-action="folder-enabled"
+                                data-folder="${escapeHtml(group.folder)}"
+                                data-partial="${groupPartial ? "true" : "false"}"
+                                ${groupEnabledCount > 0 ? "checked" : ""}
+                            >
+                            <span class="cycle-folder-name">${escapeHtml(group.folder)}</span>
                         </label>
-                        <span class="cycle-step-index">${index + 1}</span>
-                        <button type="button" class="cycle-step-main secondary" data-cycle-action="select" data-sequence-id="${escapeHtml(sequenceId)}">
-                            <span class="cycle-step-name">${escapeHtml(item?.name || sequenceId)}</span>
-                            <span class="cycle-step-meta">${escapeHtml(tag)}</span>
-                        </button>
-                        <div class="cycle-step-actions">
-                            <button type="button" class="secondary" data-cycle-action="up" data-sequence-id="${escapeHtml(sequenceId)}" ${index === 0 ? "disabled" : ""}>Up</button>
-                            <button type="button" class="secondary" data-cycle-action="down" data-sequence-id="${escapeHtml(sequenceId)}" ${index === orderIds.length - 1 ? "disabled" : ""}>Down</button>
-                        </div>
+                        <span class="cycle-folder-meta">${groupEnabledCount}/${group.ids.length} enabled</span>
                     </div>
-                `;
-            }).join("");
+                `);
+
+                for (const sequenceId of group.ids) {
+                    const item = libraryItemById(sequenceId);
+                    const isActive = sequenceId === state.selected_sequence_id;
+                    const isPending = sequenceId === pendingId;
+                    const isDisabled = disabledIds.has(sequenceId);
+                    const classes = [
+                        "cycle-step",
+                        isActive ? "is-active" : "",
+                        isPending ? "is-pending" : "",
+                        isDisabled ? "is-disabled" : ""
+                    ].filter(Boolean).join(" ");
+                    const tag = isPending
+                        ? "Next"
+                        : (isDisabled ? "Skipped" : (isActive ? "Current" : describeTimelineItem(item)));
+                    const currentFolder = sequenceFolderLabel(item);
+                    const previousFolder = stepIndex > 0 ? sequenceFolderLabel(libraryItemById(orderIds[stepIndex - 1])) : null;
+                    const nextFolder = stepIndex < orderIds.length - 1 ? sequenceFolderLabel(libraryItemById(orderIds[stepIndex + 1])) : null;
+                    const canMoveUp = stepIndex > 0 && previousFolder === currentFolder;
+                    const canMoveDown = stepIndex < orderIds.length - 1 && nextFolder === currentFolder;
+                    parts.push(`
+                        <div class="${classes}" data-sequence-id="${escapeHtml(sequenceId)}">
+                            <label class="cycle-step-toggle" aria-label="Include ${escapeHtml(sequenceDisplayName(item) || sequenceId)}">
+                                <input type="checkbox" data-cycle-action="enabled" data-sequence-id="${escapeHtml(sequenceId)}" ${isDisabled ? "" : "checked"}>
+                            </label>
+                            <span class="cycle-step-index">${stepIndex + 1}</span>
+                            <button type="button" class="cycle-step-main secondary" data-cycle-action="select" data-sequence-id="${escapeHtml(sequenceId)}">
+                                <span class="cycle-step-name">${escapeHtml(item?.display_name || item?.name || sequenceId)}</span>
+                                <span class="cycle-step-meta">${escapeHtml(tag)}</span>
+                            </button>
+                            <div class="cycle-step-actions">
+                                <button type="button" class="secondary" data-cycle-action="up" data-sequence-id="${escapeHtml(sequenceId)}" ${canMoveUp ? "" : "disabled"}>Up</button>
+                                <button type="button" class="secondary" data-cycle-action="down" data-sequence-id="${escapeHtml(sequenceId)}" ${canMoveDown ? "" : "disabled"}>Down</button>
+                            </div>
+                        </div>
+                    `);
+                    stepIndex += 1;
+                }
+            }
+            cycleTimeline.innerHTML = parts.join("");
+            cycleTimeline.querySelectorAll('input[data-cycle-action="folder-enabled"]').forEach((input) => {
+                input.indeterminate = input.dataset.partial === "true";
+            });
         }
 
         function sequenceForState(state) {
@@ -2057,6 +2226,9 @@
             return {
                 id: state.selected_sequence_id,
                 name: state.selected_sequence_name,
+                display_name: state.selected_sequence_display_name || state.selected_sequence_name,
+                display_label: state.selected_sequence_display_name || state.selected_sequence_name,
+                folder: state.selected_sequence_folder || "",
                 kind: state.selected_sequence_kind,
                 frame_count: state.selected_sequence_frame_count,
                 media_url: state.selected_sequence_media_url,
@@ -2162,7 +2334,11 @@
             syncQrSettingsUi();
             syncFieldValue(pauseExtendInput, state.cycle_pause_extend_sec);
             syncFieldValue(pauseRetractInput, state.cycle_pause_retract_sec);
-            syncFieldValue(sequenceSelect, state.selected_sequence_id || "");
+            const selectedSequenceId = state.selected_sequence_id || "";
+            if (!sequenceSelectHasOption(selectedSequenceId)) {
+                populateLibrary(selectedSequenceId);
+            }
+            syncFieldValue(sequenceSelect, selectedSequenceId);
         }
 
         function formatTimer(seconds) {
@@ -2372,19 +2548,49 @@
         }
 
         function populateLibrary(selectedId) {
+            const searchTerm = normalizedSequenceSearchTerm();
+            const matches = libraryItems.filter((item) => sequenceMatchesSearch(item, searchTerm));
+            const matchIds = new Set(matches.map((item) => item.id));
+            const selectedItem = selectedId ? libraryItemById(selectedId) : null;
+            const selectedKept = Boolean(searchTerm && selectedItem && !matchIds.has(selectedId));
+            const optionItems = libraryItems.filter((item) => item.id === selectedId || matchIds.has(item.id));
+            visibleSequenceSearchIds = matches.map((item) => item.id);
+
             const options = ['<option value="">No sequence</option>'];
-            for (const item of libraryItems) {
+            let currentFolder = null;
+            for (const item of optionItems) {
+                const folder = sequenceFolderLabel(item);
+                if (folder !== currentFolder) {
+                    if (currentFolder !== null) options.push("</optgroup>");
+                    options.push(`<optgroup label="${escapeHtml(folder)}">`);
+                    currentFolder = folder;
+                }
                 const baseSuffix = item.kind === "images" ? `${item.frame_count} frames` : "video";
                 const suffix = ` (${baseSuffix}, ${formatSequenceSpan(item)})`;
                 const selected = item.id === selectedId ? " selected" : "";
-                options.push(`<option value="${item.id}"${selected}>${item.name}${suffix}</option>`);
+                const label = item.display_name || item.name || item.id;
+                options.push(`<option value="${escapeHtml(item.id)}"${selected}>${escapeHtml(label)}${escapeHtml(suffix)}</option>`);
+            }
+            if (currentFolder !== null) options.push("</optgroup>");
+            if (optionItems.length === 0) {
+                options.push('<option value="" disabled>No matching sequences</option>');
             }
             sequenceSelect.innerHTML = options.join("");
+
+            if (searchTerm) {
+                const noun = matches.length === 1 ? "match" : "matches";
+                sequenceSearchMeta.textContent = selectedKept
+                    ? `${matches.length} ${noun}; current sequence kept in list`
+                    : `${matches.length} ${noun}`;
+            } else {
+                sequenceSearchMeta.textContent = `${libraryItems.length} sequences`;
+            }
+            clearSequenceSearchBtn.disabled = !searchTerm;
         }
 
         async function loadLibrary(selectedId = null) {
             const payload = await apiGet("/api/library");
-            libraryItems = payload.items || [];
+            libraryItems = (payload.items || []).slice().sort(compareLibraryItems);
             populateLibrary(selectedId || (currentState && currentState.selected_sequence_id));
             if (currentState) renderStatus(currentState);
         }
@@ -2410,6 +2616,14 @@
             renderPreview();
         }
 
+        async function selectSequence(sequenceId) {
+            const normalizedId = sequenceId || null;
+            holdFormSync();
+            await pushSettings({ sequence_id: normalizedId });
+            await loadSequence(normalizedId);
+            populateLibrary(normalizedId);
+        }
+
         function renderPreview() {
             if (!currentState || !currentSequence) {
                 previewEmpty.textContent = "Select a sequence.";
@@ -2418,7 +2632,7 @@
                 return;
             }
 
-            const sequenceName = currentState.selected_sequence_name || currentSequence.name || "Sequence";
+            const sequenceName = currentState.selected_sequence_display_name || sequenceDisplayName(currentSequence) || "Sequence";
 
             if (currentSequence.kind === "images") {
                 const frame = frameIndexForSequencePosition(
@@ -2648,13 +2862,53 @@
             pauseRetractInput.value = String(value);
             pushSettings({ cycle_pause_retract_sec: value }).catch(() => {});
         });
+
+        sequenceSearchInput.addEventListener("input", () => {
+            populateLibrary(currentState?.selected_sequence_id || sequenceSelect.value || null);
+        });
+
+        sequenceSearchInput.addEventListener("keydown", async (event) => {
+            if (event.key !== "Enter") return;
+            if (!normalizedSequenceSearchTerm()) return;
+            const firstMatch = visibleSequenceSearchIds[0];
+            if (!firstMatch) return;
+            event.preventDefault();
+            sequenceSelect.value = firstMatch;
+            await selectSequence(firstMatch);
+        });
+
+        clearSequenceSearchBtn.addEventListener("click", () => {
+            sequenceSearchInput.value = "";
+            populateLibrary(currentState?.selected_sequence_id || sequenceSelect.value || null);
+            sequenceSearchInput.focus();
+        });
+
         sequenceSelect.addEventListener("change", async () => {
-            holdFormSync();
-            await pushSettings({ sequence_id: sequenceSelect.value || null });
-            await loadSequence(sequenceSelect.value || null);
+            await selectSequence(sequenceSelect.value || null);
         });
 
         cycleTimeline.addEventListener("change", async (event) => {
+            const folderInput = event.target.closest('input[type="checkbox"][data-cycle-action="folder-enabled"]');
+            if (folderInput) {
+                const folder = folderInput.dataset.folder;
+                const orderIds = cycleOrderIdsFromState();
+                const folderIds = orderIds.filter((sequenceId) => {
+                    const item = libraryItemById(sequenceId);
+                    return sequenceFolderLabel(item) === folder;
+                });
+                const disabled = cycleDisabledIdSetFromState();
+                for (const sequenceId of folderIds) {
+                    if (folderInput.checked) {
+                        disabled.delete(sequenceId);
+                    } else {
+                        disabled.add(sequenceId);
+                    }
+                }
+                holdFormSync();
+                await pushSettings({ cycle_disabled_ids: [...disabled] });
+                return;
+            }
+
             const input = event.target.closest('input[type="checkbox"][data-cycle-action="enabled"]');
             if (!input) return;
             const sequenceId = input.dataset.sequenceId;
@@ -2688,6 +2942,9 @@
             const delta = action === "up" ? -1 : (action === "down" ? 1 : 0);
             const nextIndex = index + delta;
             if (index < 0 || nextIndex < 0 || nextIndex >= orderIds.length) return;
+            const currentFolder = sequenceFolderLabel(libraryItemById(sequenceId));
+            const nextFolder = sequenceFolderLabel(libraryItemById(orderIds[nextIndex]));
+            if (currentFolder !== nextFolder) return;
             const nextOrder = [...orderIds];
             [nextOrder[index], nextOrder[nextIndex]] = [nextOrder[nextIndex], nextOrder[index]];
             holdFormSync();

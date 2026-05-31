@@ -20,7 +20,7 @@ import zlib
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
@@ -59,7 +59,7 @@ LPWM = 19
 REN = 23
 LEN = 24
 PWM_HZ = 200
-EXTEND_SEC = 21.4
+EXTEND_SEC = 21.45
 RETRACT_SEC = 21.45
 HOME_TIMEOUT_SEC = 25.0
 LIFT_STROKE_CM = 48.0
@@ -90,6 +90,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
 MEDIA_IMPORT_TEMP_SUFFIXES = (".partial", ".tmp", ".incoming", ".copying")
+POSITION_TARGET_EPSILON_PCT = 0.05
 QR_SYNC_DEFAULT_GUARD_SEC = 5.0
 QR_SYNC_SETTINGS_VERSION = 4
 QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
@@ -103,7 +104,10 @@ QR_SYNC_DEFAULT_NAME_COUNT = 1
 QR_SYNC_MAX_NAME_COUNT = 7
 QR_SYNC_DEFAULT_NAME_CHARS = 32
 QR_SYNC_MAX_NAME_CHARS = 64
-MPV_DEFAULT_FPS_CAP = 30.0
+MPV_DEFAULT_FPS_CAP = 0.0
+MPV_SEEK_MIN_INTERVAL_SEC = 0.18
+MPV_IMAGE_POSITION_SYNC_INTERVAL_SEC = 0.08
+MPV_SEQUENCE_BOUNDARY_GRACE_CM = 0.35
 DEFAULT_DISPLAY_BACKEND = "mpv"
 AUTO_START_CYCLE_ON_BOOT_DEFAULT = False
 AUTO_START_CYCLE_DELAY_SEC_DEFAULT = 120.0
@@ -194,7 +198,9 @@ def frame_stride_for_sequence(sequence: "SequenceItem", direction: int, duty: fl
     if sequence.kind != "images" or sequence.frame_count <= 1:
         return 1, 0.0, 0.0
     duration_sec = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
-    requested_fps = (sequence.frame_count - 1) / duration_sec
+    requested_fps = sequence.frame_count / duration_sec
+    if fps_cap <= 0:
+        return 1, requested_fps, duration_sec
     stride = max(1, math.ceil(requested_fps / max(1.0, fps_cap)))
     return stride, requested_fps, duration_sec
 
@@ -265,6 +271,8 @@ class SequenceItem:
     name: str
     kind: str
     relative_path: str
+    folder: str = ""
+    display_name: str = ""
     frame_count: int = 0
     frame_paths: list[str] = field(default_factory=list)
     media_url: str | None = None
@@ -277,13 +285,23 @@ class SequenceItem:
     def end_cm(self) -> float:
         return min(LIFT_STROKE_CM, self.start_cm + self.volume_height_cm)
 
-    def playback_ratio_for_pct(self, position_pct: float) -> float | None:
+    @property
+    def display_label(self) -> str:
+        name = self.display_name or self.name
+        return f"{self.folder} / {name}" if self.folder else name
+
+    def playback_ratio_for_pct(self, position_pct: float, boundary_grace_cm: float = 0.0) -> float | None:
         position_cm = (clamp(position_pct, 0.0, 100.0) / 100.0) * LIFT_STROKE_CM
         end_cm = self.end_cm
+        boundary_grace_cm = max(0.0, boundary_grace_cm)
 
         if position_cm < self.start_cm:
+            if boundary_grace_cm and position_cm >= self.start_cm - boundary_grace_cm:
+                return 0.0
             return 0.0 if self.outside_playback == "hold" else None
         if position_cm > end_cm:
+            if boundary_grace_cm and position_cm <= end_cm + boundary_grace_cm:
+                return 1.0
             return 1.0 if self.outside_playback == "hold" else None
 
         span_cm = max(MIN_SEQUENCE_HEIGHT_CM, end_cm - self.start_cm)
@@ -301,6 +319,9 @@ class SequenceItem:
         return {
             "id": self.id,
             "name": self.name,
+            "display_name": self.display_name or self.name,
+            "display_label": self.display_label,
+            "folder": self.folder,
             "kind": self.kind,
             "relative_path": self.relative_path,
             "frame_count": self.frame_count,
@@ -350,6 +371,19 @@ class SequenceLibrary:
 
     def _metadata_for_video(self, file_path: Path) -> dict[str, Any]:
         return self._read_metadata(file_path.with_suffix(".json"))
+
+    def _display_name(self, metadata: dict[str, Any], fallback: str) -> str:
+        for key in ("name", "title", "display_name"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback
+
+    def _folder_for_path(self, relative_path: str) -> str:
+        if not relative_path or relative_path == ".":
+            return ""
+        parent = PurePosixPath(relative_path).parent.as_posix()
+        return "" if parent == "." else parent
 
     def _signature_for_paths(self, paths: list[Path]) -> str:
         digest = hashlib.sha1()
@@ -417,14 +451,17 @@ class SequenceLibrary:
                     metadata_path = file_path.with_suffix(".json")
                     if metadata_path.is_file():
                         signature_paths.append(metadata_path)
+                    metadata = self._metadata_for_video(file_path)
                     start_cm, height_cm, outside_playback = self._sequence_span(
-                        self._metadata_for_video(file_path)
+                        metadata
                     )
                     items[rel_path] = SequenceItem(
                         id=rel_path,
                         name=file_path.stem,
+                        display_name=self._display_name(metadata, file_path.stem),
                         kind="video",
                         relative_path=rel_path,
+                        folder=self._folder_for_path(rel_path),
                         media_url=media_url_for(rel_path),
                         content_signature=self._signature_for_paths(signature_paths),
                         start_cm=start_cm,
@@ -443,14 +480,17 @@ class SequenceLibrary:
             metadata_path = directory / SEQUENCE_METADATA_FILENAME
             if metadata_path.is_file():
                 signature_paths.append(metadata_path)
+            metadata = self._metadata_for_directory(directory)
             start_cm, height_cm, outside_playback = self._sequence_span(
-                self._metadata_for_directory(directory)
+                metadata
             )
             items[sequence_id] = SequenceItem(
                 id=sequence_id,
                 name=display_name,
+                display_name=self._display_name(metadata, display_name),
                 kind="images",
                 relative_path=rel_dir or ".",
+                folder=self._folder_for_path(rel_dir),
                 frame_count=len(image_paths),
                 frame_paths=image_paths,
                 content_signature=self._signature_for_paths(signature_paths),
@@ -462,8 +502,9 @@ class SequenceLibrary:
         order = sorted(
             items,
             key=lambda item_id: (
+                items[item_id].folder.lower(),
                 items[item_id].kind != "images",
-                items[item_id].name.lower(),
+                items[item_id].display_label.lower(),
                 item_id.lower(),
             ),
         )
@@ -641,8 +682,8 @@ class ActuatorHardware:
             with self.lock:
                 current = self.position_pct
             if direction > 0:
-                return current >= target_pct - 0.5
-            return current <= target_pct + 0.5
+                return current >= target_pct - POSITION_TARGET_EPSILON_PCT
+            return current <= target_pct + POSITION_TARGET_EPSILON_PCT
 
         self._soft_pwm_loop(pin, duty, 3600.0, update_position, stop_condition)
 
@@ -1466,6 +1507,7 @@ class InstallationController:
             "cycle_enabled_count": len(cycle_enabled_ids),
             "cycle_next_sequence_id": cycle_next_sequence_id,
             "cycle_next_sequence_name": cycle_next_sequence.name if cycle_next_sequence else None,
+            "cycle_next_sequence_display_name": cycle_next_sequence.display_label if cycle_next_sequence else None,
             "is_moving": is_moving,
             "is_paused": is_paused,
             "is_cycling": is_cycling,
@@ -1476,6 +1518,8 @@ class InstallationController:
             "last_runtime_error": last_runtime_error,
             "selected_sequence_id": selected_sequence_id,
             "selected_sequence_name": sequence.name if sequence else None,
+            "selected_sequence_display_name": sequence.display_label if sequence else None,
+            "selected_sequence_folder": sequence.folder if sequence else None,
             "selected_sequence_kind": sequence.kind if sequence else None,
             "selected_sequence_frame_count": sequence.frame_count if sequence else 0,
             "selected_sequence_media_url": sequence.media_url if sequence else None,
@@ -1493,6 +1537,7 @@ class InstallationController:
             "display_url": "/display",
             "display_backend_mode": display_backend_mode,
             "display_backend_status": display_backend_status,
+            "mpv_fps_cap": self.mpv_fps_cap,
             "camera_url": configured_camera_url(),
             "qr_sync_enabled": qr_sync_enabled,
             "qr_sync_debug_enabled": qr_sync_debug_enabled,
@@ -1750,7 +1795,7 @@ class InstallationController:
             current = self.hardware.position_pct
 
         delta = target - current
-        if abs(delta) < 0.5:
+        if abs(delta) < POSITION_TARGET_EPSILON_PCT:
             with self.state_lock:
                 self.active_target = None
             return
@@ -1778,7 +1823,7 @@ class InstallationController:
         with self.hardware.lock:
             current = self.hardware.position_pct
         delta = new_target - current
-        if abs(delta) < 0.5:
+        if abs(delta) < POSITION_TARGET_EPSILON_PCT:
             with self.state_lock:
                 self.active_target = None
             return
@@ -1968,7 +2013,7 @@ class InstallationController:
             with self.hardware.lock:
                 current = self.hardware.position_pct
             delta = target_pct - current
-            if abs(delta) < 0.5:
+            if abs(delta) < POSITION_TARGET_EPSILON_PCT:
                 return True
 
             self.hardware.resume()
@@ -2625,7 +2670,7 @@ class MpvDisplayBackend:
     ):
         self.controller = controller
         self.mpv_bin = mpv_bin
-        self.fps_cap = max(1.0, float(fps_cap))
+        self.fps_cap = max(0.0, float(fps_cap))
         self.display_env = normalized_mpv_display_env(display_env)
         self.process: subprocess.Popen[Any] | None = None
         self.sock: socket.socket | None = None
@@ -2884,9 +2929,9 @@ class MpvDisplayBackend:
         self._command(["set_property", "speed", speed])
         self.last_speed = speed
 
-    def _seek(self, seconds: float, force: bool = False) -> None:
+    def _seek(self, seconds: float, force: bool = False, min_interval: float = MPV_SEEK_MIN_INTERVAL_SEC) -> None:
         now = time.time()
-        if not force and now - self.last_seek_at < 0.18:
+        if not force and now - self.last_seek_at < max(0.0, min_interval):
             return
         self._command(["set_property", "time-pos", max(0.0, seconds)])
         self.last_seek_at = now
@@ -2957,7 +3002,9 @@ class MpvDisplayBackend:
             indexes.reverse()
 
         frame_count = max(1, len(indexes))
-        fps = clamp((frame_count - 1) / max(0.01, duration_sec), 0.1, self.fps_cap)
+        fps = max(0.1, frame_count / max(0.01, duration_sec))
+        if self.fps_cap > 0:
+            fps = min(fps, self.fps_cap)
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.id)[:80] or "sequence"
         content_signature = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.content_signature or "nosig")[:24]
         playlist_path = self.playlist_dir / f"{safe_id}_{content_signature}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
@@ -2975,6 +3022,7 @@ class MpvDisplayBackend:
             "source": f"mf://@{playlist_path}",
             "options": {"mf-fps": f"{fps:.6f}"},
             "duration_sec": duration_sec,
+            "frame_duration_sec": 1.0 / fps if fps > 0 else duration_sec,
             "fps": fps,
             "stride": stride,
             "requested_fps": requested_fps,
@@ -3011,19 +3059,30 @@ class MpvDisplayBackend:
             return float(duration)
         return None
 
+    def _image_time_for_ratio(self, plan: dict[str, Any], playback_ratio: float) -> float:
+        duration_sec = max(0.0, float(plan.get("duration_sec") or 0.0))
+        target_time = clamp(playback_ratio, 0.0, 1.0) * duration_sec
+        frame_duration = max(0.0, float(plan.get("frame_duration_sec") or 0.0))
+        if duration_sec > 0 and frame_duration > 0:
+            target_time = min(target_time, max(0.0, duration_sec - (frame_duration * 0.5)))
+        return target_time
+
     def _sync_images(self, sequence: SequenceItem, state: dict[str, Any], ratio: float, direction: int, moving: bool) -> None:
         plan = self._image_plan(sequence, state, direction)
         if not self._load_source(plan["key"], plan["source"], plan["options"]):
             self._load_black()
             return
         playback_ratio = ratio if direction >= 0 else 1.0 - ratio
+        target_time = self._image_time_for_ratio(plan, playback_ratio)
         self._set_speed(1.0)
         if not moving:
             self._set_pause(True)
-            self._seek(playback_ratio * plan["duration_sec"], force=True)
+            self._seek(target_time, force=True)
             return
         if self.last_pause is not False:
-            self._seek(playback_ratio * plan["duration_sec"], force=True)
+            self._seek(target_time, force=True)
+        else:
+            self._seek(target_time, force=False, min_interval=MPV_IMAGE_POSITION_SYNC_INTERVAL_SEC)
         self._set_pause(False)
 
     def _sync_video(self, sequence: SequenceItem, state: dict[str, Any], ratio: float, direction: int, moving: bool) -> None:
@@ -3068,13 +3127,14 @@ class MpvDisplayBackend:
             return
 
         position_pct = float(state.get("position_pct") or 0.0)
-        ratio = sequence.playback_ratio_for_pct(position_pct)
+        direction = self._direction_for_state(state)
+        moving = bool(state.get("is_moving")) and not bool(state.get("is_paused"))
+        boundary_grace = MPV_SEQUENCE_BOUNDARY_GRACE_CM if moving and sequence.kind == "images" else 0.0
+        ratio = sequence.playback_ratio_for_pct(position_pct, boundary_grace_cm=boundary_grace)
         if ratio is None:
             self._load_black()
             return
 
-        direction = self._direction_for_state(state)
-        moving = bool(state.get("is_moving")) and not bool(state.get("is_paused"))
         if sequence.kind == "images":
             self._sync_images(sequence, state, ratio, direction, moving)
         elif sequence.kind == "video":
@@ -3159,7 +3219,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Fullscreen display backend to manage from the server (default: {DEFAULT_DISPLAY_BACKEND})",
     )
     parser.add_argument("--mpv-bin", default=os.environ.get("TIME_VOLUME_MPV_BIN", "mpv"), help="MPV executable for --display-backend mpv")
-    parser.add_argument("--mpv-fps-cap", type=float, default=float(os.environ.get("TIME_VOLUME_MPV_FPS_CAP", MPV_DEFAULT_FPS_CAP)), help="Maximum sampled image-sequence FPS for MPV")
+    parser.add_argument(
+        "--mpv-fps-cap",
+        type=float,
+        default=float(os.environ.get("TIME_VOLUME_MPV_FPS_CAP", MPV_DEFAULT_FPS_CAP)),
+        help="Maximum sampled image-sequence FPS for MPV; use 0 to disable frame sampling",
+    )
     return parser
 
 

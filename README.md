@@ -28,6 +28,26 @@ plays over the full 0-48 cm stroke. With the example above, the sequence plays
 from 0-32 cm and the display is black outside that span. For videos, use a JSON
 sidecar with the same base name as the clip, such as `clip.json` for `clip.mp4`.
 
+`media/` can contain organizing subfolders. Each folder that directly contains
+image frames becomes one image sequence, and video files become sequences in
+the folder where they live:
+
+```text
+media/
+  astronomy/
+    moon/
+      0001.png
+      sequence.json
+    jwst.mp4
+  objects/
+    apple/
+      0001.png
+```
+
+The controller groups sequences by folder, so these appear under `astronomy`
+and `objects`. A `sequence.json` or video sidecar can also set `"name"` to
+override the displayed sequence name.
+
 ## Updating Media
 
 For the most reliable updates, copy new or replacement folders into `media/`
