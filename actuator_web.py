@@ -106,8 +106,13 @@ QR_SYNC_DEFAULT_NAME_CHARS = 32
 QR_SYNC_MAX_NAME_CHARS = 64
 MPV_DEFAULT_FPS_CAP = 0.0
 MPV_SEEK_MIN_INTERVAL_SEC = 0.18
-MPV_IMAGE_POSITION_SYNC_INTERVAL_SEC = 0.08
-MPV_SEQUENCE_BOUNDARY_GRACE_CM = 0.35
+MPV_IMAGE_DRIFT_CHECK_INTERVAL_SEC = 0.12
+MPV_IMAGE_END_DRIFT_CHECK_INTERVAL_SEC = 0.04
+MPV_IMAGE_DRIFT_SEEK_THRESHOLD_SEC = 0.08
+MPV_IMAGE_END_DRIFT_SEEK_THRESHOLD_SEC = 0.035
+MPV_IMAGE_BACKWARD_DRIFT_SEEK_THRESHOLD_SEC = 0.24
+MPV_IMAGE_END_SYNC_RATIO = 0.96
+MPV_SEQUENCE_END_GRACE_CM = 0.18
 DEFAULT_DISPLAY_BACKEND = "mpv"
 AUTO_START_CYCLE_ON_BOOT_DEFAULT = False
 AUTO_START_CYCLE_DELAY_SEC_DEFAULT = 120.0
@@ -290,17 +295,23 @@ class SequenceItem:
         name = self.display_name or self.name
         return f"{self.folder} / {name}" if self.folder else name
 
-    def playback_ratio_for_pct(self, position_pct: float, boundary_grace_cm: float = 0.0) -> float | None:
+    def playback_ratio_for_pct(
+        self,
+        position_pct: float,
+        lower_grace_cm: float = 0.0,
+        upper_grace_cm: float = 0.0,
+    ) -> float | None:
         position_cm = (clamp(position_pct, 0.0, 100.0) / 100.0) * LIFT_STROKE_CM
         end_cm = self.end_cm
-        boundary_grace_cm = max(0.0, boundary_grace_cm)
+        lower_grace_cm = max(0.0, lower_grace_cm)
+        upper_grace_cm = max(0.0, upper_grace_cm)
 
         if position_cm < self.start_cm:
-            if boundary_grace_cm and position_cm >= self.start_cm - boundary_grace_cm:
+            if lower_grace_cm and position_cm >= self.start_cm - lower_grace_cm:
                 return 0.0
             return 0.0 if self.outside_playback == "hold" else None
         if position_cm > end_cm:
-            if boundary_grace_cm and position_cm <= end_cm + boundary_grace_cm:
+            if upper_grace_cm and position_cm <= end_cm + upper_grace_cm:
                 return 1.0
             return 1.0 if self.outside_playback == "hold" else None
 
@@ -2683,6 +2694,7 @@ class MpvDisplayBackend:
         self.last_pause: bool | None = None
         self.last_speed: float | None = None
         self.last_seek_at = 0.0
+        self.last_image_drift_check_at = 0.0
         self.duration_cache: dict[tuple[Any, ...], float] = {}
         self.playlist_dir = RUN_DIR / "mpv_playlists"
         self.last_direction = 1
@@ -2720,6 +2732,11 @@ class MpvDisplayBackend:
             "--osd-font-size=34",
             "--keep-open=yes",
             "--loop-file=no",
+            "--cache=yes",
+            "--cache-pause=no",
+            "--demuxer-readahead-secs=12",
+            "--demuxer-max-bytes=268435456",
+            "--demuxer-max-back-bytes=67108864",
             f"--input-ipc-server={MPV_IPC_PATH}",
         ]
 
@@ -2936,6 +2953,36 @@ class MpvDisplayBackend:
         self._command(["set_property", "time-pos", max(0.0, seconds)])
         self.last_seek_at = now
 
+    def _time_pos(self) -> float | None:
+        response = self._command(["get_property", "time-pos"], timeout=0.08)
+        value = response.get("data") if response else None
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return max(0.0, float(value))
+        return None
+
+    def _sync_image_drift(self, target_time: float, playback_ratio: float) -> None:
+        now = time.time()
+        near_end = playback_ratio >= MPV_IMAGE_END_SYNC_RATIO
+        check_interval = MPV_IMAGE_END_DRIFT_CHECK_INTERVAL_SEC if near_end else MPV_IMAGE_DRIFT_CHECK_INTERVAL_SEC
+        if now - self.last_image_drift_check_at < check_interval:
+            return
+        self.last_image_drift_check_at = now
+
+        current_time = self._time_pos()
+        if current_time is None:
+            self._seek(target_time, force=False)
+            return
+
+        behind_by = target_time - current_time
+        ahead_by = current_time - target_time
+        behind_threshold = (
+            MPV_IMAGE_END_DRIFT_SEEK_THRESHOLD_SEC
+            if near_end
+            else MPV_IMAGE_DRIFT_SEEK_THRESHOLD_SEC
+        )
+        if behind_by > behind_threshold or ahead_by > MPV_IMAGE_BACKWARD_DRIFT_SEEK_THRESHOLD_SEC:
+            self._seek(target_time, force=True)
+
     def _load_black(self) -> None:
         self._clear_osd()
         key = ("black",)
@@ -3031,6 +3078,7 @@ class MpvDisplayBackend:
     def _load_source(self, key: tuple[Any, ...], source: str, options: dict[str, Any] | None = None) -> bool:
         if self.loaded_key == key:
             return True
+        self._command(["set_property", "pause", True], timeout=0.2)
         if options and "mf-fps" in options:
             try:
                 self._command(["set_property", "mf-fps", float(options["mf-fps"])])
@@ -3046,6 +3094,7 @@ class MpvDisplayBackend:
         self.last_pause = None
         self.last_speed = None
         self.last_seek_at = 0.0
+        self.last_image_drift_check_at = 0.0
         return True
 
     def _duration_for_loaded_video(self, key: tuple[Any, ...]) -> float | None:
@@ -3082,7 +3131,7 @@ class MpvDisplayBackend:
         if self.last_pause is not False:
             self._seek(target_time, force=True)
         else:
-            self._seek(target_time, force=False, min_interval=MPV_IMAGE_POSITION_SYNC_INTERVAL_SEC)
+            self._sync_image_drift(target_time, playback_ratio)
         self._set_pause(False)
 
     def _sync_video(self, sequence: SequenceItem, state: dict[str, Any], ratio: float, direction: int, moving: bool) -> None:
@@ -3129,8 +3178,18 @@ class MpvDisplayBackend:
         position_pct = float(state.get("position_pct") or 0.0)
         direction = self._direction_for_state(state)
         moving = bool(state.get("is_moving")) and not bool(state.get("is_paused"))
-        boundary_grace = MPV_SEQUENCE_BOUNDARY_GRACE_CM if moving and sequence.kind == "images" else 0.0
-        ratio = sequence.playback_ratio_for_pct(position_pct, boundary_grace_cm=boundary_grace)
+        lower_grace_cm = 0.0
+        upper_grace_cm = 0.0
+        if moving and sequence.kind == "images":
+            if direction >= 0:
+                upper_grace_cm = MPV_SEQUENCE_END_GRACE_CM
+            else:
+                lower_grace_cm = MPV_SEQUENCE_END_GRACE_CM
+        ratio = sequence.playback_ratio_for_pct(
+            position_pct,
+            lower_grace_cm=lower_grace_cm,
+            upper_grace_cm=upper_grace_cm,
+        )
         if ratio is None:
             self._load_black()
             return
