@@ -48,6 +48,12 @@ The controller groups sequences by folder, so these appear under `astronomy`
 and `objects`. A `sequence.json` or video sidecar can also set `"name"` to
 override the displayed sequence name.
 
+To add a controller preview image for an image-sequence folder, place a file
+named `preview`, `poster`, `thumbnail`, or `cover` with an image extension in
+that folder, for example `preview.png` or `poster.jpg`. These files are ignored
+for playback. For video sequences, use a sidecar next to the video, such as
+`jwst.preview.jpg` for `jwst.mp4`.
+
 ## Updating Media
 
 For the most reliable updates, copy new or replacement folders into `media/`

@@ -200,6 +200,8 @@
         button.secondary { background: rgba(255, 255, 255, 0.04); }
         button.danger { background: rgb(255, 0, 0); color: #ffd8de; }
         button.ok { background: rgba(255, 255, 255, 0.04); color: var(--text); }
+        button[disabled] { opacity: 0.58; cursor: default; }
+        button.is-loading[disabled] { cursor: wait; }
         .button-grid button { min-height: 64px; font-weight: 700; }
 
         .control-rail {
@@ -533,6 +535,29 @@
             line-height: 1.2;
         }
 
+        .sequence-poster {
+            display: none;
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            min-height: 140px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            background: #000;
+            overflow: hidden;
+        }
+
+        .sequence-poster.is-visible {
+            display: block;
+        }
+
+        .sequence-poster img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+        }
+
         .sequence-select,
         .order-select {
             min-height: 56px;
@@ -774,7 +799,7 @@
 
         .cycle-step {
             display: grid;
-            grid-template-columns: auto auto 1fr auto;
+            grid-template-columns: auto auto auto 1fr auto;
             gap: 10px;
             align-items: center;
             min-width: 0;
@@ -816,6 +841,27 @@
             color: var(--text);
             font-weight: 800;
             font-size: 0.86rem;
+        }
+
+        .cycle-step-thumb {
+            width: 44px;
+            height: 44px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.04);
+            object-fit: cover;
+            overflow: hidden;
+        }
+
+        .cycle-step-thumb.is-empty {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--muted);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
         }
 
         .cycle-step-main {
@@ -900,6 +946,21 @@
             word-break: break-word;
         }
 
+        .sequence-meta .footer-note[data-tone="active"] {
+            color: var(--accent);
+            border-color: rgba(242, 182, 97, 0.28);
+        }
+
+        .sequence-meta .footer-note[data-tone="ok"] {
+            color: #dff4cf;
+            border-color: rgba(190, 226, 152, 0.28);
+        }
+
+        .sequence-meta .footer-note[data-tone="warn"] {
+            color: #ffd8de;
+            border-color: rgba(217, 92, 109, 0.34);
+        }
+
         .icon-button {
             min-width: 56px;
             min-height: 56px;
@@ -917,6 +978,14 @@
             fill: none;
             stroke-linecap: round;
             stroke-linejoin: round;
+        }
+
+        .icon-button.is-loading .button-icon {
+            animation: spin 0.85s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
 
         .jog-button {
@@ -1062,7 +1131,7 @@
                 display: grid;
             }
             .cycle-step {
-                grid-template-columns: auto auto minmax(0, 1fr);
+                grid-template-columns: auto auto auto minmax(0, 1fr);
             }
             .cycle-step-actions {
                 grid-column: 1 / -1;
@@ -1331,6 +1400,9 @@
                         </div>
                         <div id="sequenceSearchMeta" class="sequence-search-meta" aria-live="polite"></div>
                     </div>
+                    <div id="sequencePoster" class="sequence-poster">
+                        <img id="sequencePosterImage" alt="Selected sequence preview" draggable="false">
+                    </div>
                     <div class="sequence-actions">
                         <button id="prevSequenceBtn" type="button" class="icon-button" aria-label="Previous sequence" title="Previous sequence">
                             <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1373,7 +1445,7 @@
                         </div>
                     </div>
                     <div class="sequence-meta">
-                        <p class="footer-note" id="mediaRootNote"></p>
+                        <p class="footer-note" id="mediaRootNote" aria-live="polite"></p>
                         <button id="refreshLibraryBtn" type="button" class="icon-button" aria-label="Refresh library" title="Refresh library">
                             <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                                 <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
@@ -1457,6 +1529,7 @@
                 <section>
                     <div class="eyebrow">Tools</div>
                     <div class="advanced-actions" style="margin-top: 10px;">
+                        <button id="reloadControllerBtn" type="button" class="secondary">Reload Controller</button>
                         <button id="homeBtn" type="button" class="ok">Force Home</button>
                     </div>
                 </section>
@@ -1528,6 +1601,10 @@
         const sequenceSearchInput = $("#sequenceSearchInput");
         const clearSequenceSearchBtn = $("#clearSequenceSearchBtn");
         const sequenceSearchMeta = $("#sequenceSearchMeta");
+        const sequencePoster = $("#sequencePoster");
+        const sequencePosterImage = $("#sequencePosterImage");
+        const prevSequenceBtn = $("#prevSequenceBtn");
+        const nextSequenceBtn = $("#nextSequenceBtn");
         const sequenceSelect = $("#sequenceSelect");
         const sequenceHeightValue = $("#sequenceHeightValue");
         const sequenceSpanValue = $("#sequenceSpanValue");
@@ -1537,6 +1614,8 @@
         const sequenceStrideValue = $("#sequenceStrideValue");
         const sequenceSummaryValue = $("#sequenceSummaryValue");
         const mediaRootNote = $("#mediaRootNote");
+        const refreshLibraryBtn = $("#refreshLibraryBtn");
+        const reloadControllerBtn = $("#reloadControllerBtn");
         const previewImage = $("#previewImage");
         const previewVideo = $("#previewVideo");
         const previewEmpty = $("#previewEmpty");
@@ -1586,6 +1665,9 @@
         let piCameraPreviewLoading = false;
         let piCameraLimitsApplied = false;
         let piCameraLimits = null;
+        let libraryStatusMessage = "";
+        let libraryStatusTone = "";
+        let libraryStatusTimer = null;
 
         const DEFAULT_LIFT_STROKE_CM = 48;
         const MIN_SEQUENCE_HEIGHT_CM = 0.01;
@@ -1711,6 +1793,14 @@
             previewImage.style.display = mode === "image" ? "block" : "none";
             previewVideo.style.display = mode === "video" ? "block" : "none";
             previewEmpty.style.display = mode === "empty" ? "flex" : "none";
+        }
+
+        function setPreviewImageUrl(url) {
+            if (previewImage.dataset.src !== url) {
+                previewImage.dataset.src = url;
+                previewImage.src = url;
+            }
+            setPreviewMode("image");
         }
 
         function setPiCameraPreviewMode(mode) {
@@ -1935,6 +2025,7 @@
             sequence.volume_height_cm = state.selected_sequence_volume_height_cm ?? sequence.volume_height_cm;
             sequence.outside_playback = state.selected_sequence_outside_playback || sequence.outside_playback || "black";
             sequence.frame_count = state.selected_sequence_frame_count || sequence.frame_count;
+            sequence.preview_url = state.selected_sequence_preview_url || sequence.preview_url || "";
         }
 
         async function apiGet(url) {
@@ -2000,6 +2091,23 @@
             qrSyncUpcomingValue.textContent = String(Number(qrSyncUpcomingRange.value || 0));
             qrSyncNameCountValue.textContent = String(Number(qrSyncNameCountRange.value || 0));
             qrSyncNameCharsValue.textContent = String(Number(qrSyncNameCharsRange.value || 0));
+        }
+
+        function setLibraryStatus(message = "", tone = "", clearAfterMs = 0) {
+            libraryStatusMessage = message;
+            libraryStatusTone = tone;
+            if (libraryStatusTimer) {
+                clearTimeout(libraryStatusTimer);
+                libraryStatusTimer = null;
+            }
+            if (clearAfterMs > 0) {
+                libraryStatusTimer = setTimeout(() => {
+                    libraryStatusMessage = "";
+                    libraryStatusTone = "";
+                    if (currentState) renderStatus(currentState);
+                }, clearAfterMs);
+            }
+            if (currentState) renderStatus(currentState);
         }
 
         function formatCm(value) {
@@ -2117,6 +2225,16 @@
             return `${kind} | ${formatSequenceSpan(item)}`;
         }
 
+        function sequencePreviewUrl(item) {
+            return item?.preview_url || "";
+        }
+
+        function sequenceThumbMarkup(item) {
+            const url = sequencePreviewUrl(item);
+            if (!url) return '<span class="cycle-step-thumb is-empty" aria-hidden="true"></span>';
+            return `<img class="cycle-step-thumb" src="${escapeHtml(url)}" alt="">`;
+        }
+
         function cycleFolderGroups(orderIds) {
             const groups = [];
             for (const sequenceId of orderIds) {
@@ -2197,6 +2315,7 @@
                                 <input type="checkbox" data-cycle-action="enabled" data-sequence-id="${escapeHtml(sequenceId)}" ${isDisabled ? "" : "checked"}>
                             </label>
                             <span class="cycle-step-index">${stepIndex + 1}</span>
+                            ${sequenceThumbMarkup(item)}
                             <button type="button" class="cycle-step-main secondary" data-cycle-action="select" data-sequence-id="${escapeHtml(sequenceId)}">
                                 <span class="cycle-step-name">${escapeHtml(item?.display_name || item?.name || sequenceId)}</span>
                                 <span class="cycle-step-meta">${escapeHtml(tag)}</span>
@@ -2232,6 +2351,7 @@
                 kind: state.selected_sequence_kind,
                 frame_count: state.selected_sequence_frame_count,
                 media_url: state.selected_sequence_media_url,
+                preview_url: state.selected_sequence_preview_url,
                 lift_stroke_cm: state.lift_stroke_cm || DEFAULT_LIFT_STROKE_CM,
                 start_cm: state.selected_sequence_start_cm || 0,
                 end_cm: state.selected_sequence_end_cm || DEFAULT_LIFT_STROKE_CM,
@@ -2240,8 +2360,23 @@
             };
         }
 
+        function renderSequencePoster(sequence) {
+            const url = sequencePreviewUrl(sequence);
+            sequencePoster.classList.toggle("is-visible", Boolean(url));
+            if (!url) {
+                sequencePosterImage.removeAttribute("src");
+                sequencePosterImage.dataset.src = "";
+                return;
+            }
+            if (sequencePosterImage.dataset.src !== url) {
+                sequencePosterImage.dataset.src = url;
+                sequencePosterImage.src = url;
+            }
+        }
+
         function renderSequenceReadout(state) {
             const sequence = sequenceForState(state);
+            renderSequencePoster(sequence);
             if (!sequence) {
                 sequenceHeightValue.textContent = "-";
                 sequenceSpanValue.textContent = "-";
@@ -2512,7 +2647,10 @@
                     : (cyclePause
                         ? `${cyclePauseLabel(cyclePause.phase)} ${formatTimer(cyclePause.remainingMs / 1000)}`
                         : "Ready"));
-            mediaRootNote.textContent = `Media: ${state.media_root}`;
+            mediaRootNote.textContent = libraryStatusMessage
+                ? `Media: ${state.media_root} | ${libraryStatusMessage}`
+                : `Media: ${state.media_root}`;
+            mediaRootNote.dataset.tone = libraryStatusTone || "idle";
             simulationPill.hidden = !state.is_simulation;
             cycleFlag.hidden = !state.is_cycling;
             cameraLink.hidden = !state.camera_url;
@@ -2586,6 +2724,9 @@
                 sequenceSearchMeta.textContent = `${libraryItems.length} sequences`;
             }
             clearSequenceSearchBtn.disabled = !searchTerm;
+            const hasVisibleSequences = visibleSequenceSearchIds.length > 0;
+            prevSequenceBtn.disabled = !hasVisibleSequences;
+            nextSequenceBtn.disabled = !hasVisibleSequences;
         }
 
         async function loadLibrary(selectedId = null) {
@@ -2593,6 +2734,7 @@
             libraryItems = (payload.items || []).slice().sort(compareLibraryItems);
             populateLibrary(selectedId || (currentState && currentState.selected_sequence_id));
             if (currentState) renderStatus(currentState);
+            return libraryItems;
         }
 
         async function loadSequence(sequenceId) {
@@ -2624,6 +2766,22 @@
             populateLibrary(normalizedId);
         }
 
+        async function advanceVisibleSequence(step) {
+            const ids = visibleSequenceSearchIds.length
+                ? visibleSequenceSearchIds
+                : libraryItems.map((item) => item.id);
+            if (!ids.length) return;
+
+            const currentId = sequenceSelect.value || currentState?.selected_sequence_id || null;
+            const currentIndex = ids.indexOf(currentId);
+            const nextIndex = currentIndex === -1
+                ? (step > 0 ? 0 : ids.length - 1)
+                : (currentIndex + step + ids.length) % ids.length;
+            const nextId = ids[nextIndex];
+            sequenceSelect.value = nextId;
+            await selectSequence(nextId);
+        }
+
         function renderPreview() {
             if (!currentState || !currentSequence) {
                 previewEmpty.textContent = "Select a sequence.";
@@ -2641,20 +2799,20 @@
                     playbackDirectionForState(currentState)
                 );
                 if (frame == null) {
-                    previewEmpty.textContent = "Outside playback span.";
                     previewMeta.textContent = `${sequenceName} | ${formatSequenceSpan(currentSequence)}`;
+                    if (currentSequence.preview_url) {
+                        setPreviewImageUrl(currentSequence.preview_url);
+                        return;
+                    }
+                    previewEmpty.textContent = "Outside playback span.";
                     setPreviewMode("empty");
                     return;
                 }
                 const index = frame.index;
                 const url = currentSequence.frame_urls[index];
-                if (previewImage.dataset.src !== url) {
-                    previewImage.dataset.src = url;
-                    previewImage.src = url;
-                }
                 const strideLabel = frame.stride > 1 ? ` | every ${frame.stride}` : "";
                 previewMeta.textContent = `${sequenceName} | Frame ${index + 1} of ${currentSequence.frame_count}${strideLabel} | ${formatSequenceSpan(currentSequence)}`;
-                setPreviewMode("image");
+                setPreviewImageUrl(url);
                 return;
             }
 
@@ -2666,8 +2824,12 @@
             }
             const videoRatio = playbackRatioForPosition(currentSequence, currentState.position_pct);
             if (videoRatio == null) {
-                previewEmpty.textContent = "Outside playback span.";
                 previewMeta.textContent = `${sequenceName} | ${formatSequenceSpan(currentSequence)}`;
+                if (currentSequence.preview_url) {
+                    setPreviewImageUrl(currentSequence.preview_url);
+                    return;
+                }
+                previewEmpty.textContent = "Outside playback span.";
                 setPreviewMode("empty");
                 return;
             }
@@ -2720,6 +2882,43 @@
         async function pushSettings(payload) {
             const result = await apiPost("/api/settings", payload);
             if (result.state) await applyState(result.state);
+        }
+
+        async function refreshMediaLibrary() {
+            const selectedId = currentState?.selected_sequence_id || sequenceSelect.value || null;
+            refreshLibraryBtn.disabled = true;
+            refreshLibraryBtn.classList.add("is-loading");
+            setLibraryStatus("Refreshing library...", "active");
+
+            try {
+                await postAction("refresh_library");
+                const selectedAfterRefresh = currentState?.selected_sequence_id || selectedId;
+                await loadLibrary(selectedAfterRefresh);
+                const previewCount = libraryItems.filter((item) => item.preview_url).length;
+                const sequenceCount = libraryItems.length;
+                const sequenceNoun = sequenceCount === 1 ? "sequence" : "sequences";
+                const previewText = previewCount ? `, ${previewCount} previews` : "";
+                setLibraryStatus(`Refreshed ${sequenceCount} ${sequenceNoun}${previewText}`, "ok", 7000);
+            } catch (error) {
+                setLibraryStatus(`Refresh failed: ${error.message || error}`, "warn", 10000);
+            } finally {
+                refreshLibraryBtn.disabled = false;
+                refreshLibraryBtn.classList.remove("is-loading");
+            }
+        }
+
+        async function reloadControllerApp() {
+            reloadControllerBtn.disabled = true;
+            setLibraryStatus("Reloading controller...", "active");
+            try {
+                const registrations = navigator.serviceWorker && navigator.serviceWorker.getRegistrations
+                    ? await navigator.serviceWorker.getRegistrations()
+                    : [];
+                await Promise.all(registrations.map((registration) => registration.update().catch(() => {})));
+            } catch (error) {}
+            const nextUrl = new URL(window.location.href);
+            nextUrl.searchParams.set("reload", String(Date.now()));
+            window.location.replace(nextUrl.toString());
         }
 
         async function startPiCameraRecord() {
@@ -2994,9 +3193,10 @@
             }
         });
 
-        $("#refreshLibraryBtn").addEventListener("click", async () => { await postAction("refresh_library"); await loadLibrary(currentState && currentState.selected_sequence_id); });
-        $("#prevSequenceBtn").addEventListener("click", async () => { await postAction("previous_sequence"); });
-        $("#nextSequenceBtn").addEventListener("click", async () => { await postAction("next_sequence"); });
+        refreshLibraryBtn.addEventListener("click", refreshMediaLibrary);
+        reloadControllerBtn.addEventListener("click", reloadControllerApp);
+        prevSequenceBtn.addEventListener("click", async () => { await advanceVisibleSequence(-1); });
+        nextSequenceBtn.addEventListener("click", async () => { await advanceVisibleSequence(1); });
         playBtn.addEventListener("click", async () => { await postAction("play_pause"); });
         cycleBtn.addEventListener("click", async () => { await postAction("cycle_toggle"); });
         $("#homeBtn").addEventListener("click", async () => { if (window.confirm("Retract fully to zero the lift?")) await postAction("home"); });
@@ -3051,9 +3251,11 @@
 
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js').catch((err) => {
-                    console.log('ServiceWorker registration failed: ', err);
-                });
+                navigator.serviceWorker.register('/sw.js')
+                    .then((registration) => registration.update().catch(() => {}))
+                    .catch((err) => {
+                        console.log('ServiceWorker registration failed: ', err);
+                    });
             });
         }
 

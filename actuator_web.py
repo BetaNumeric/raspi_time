@@ -88,6 +88,8 @@ DEFAULT_PORT = int(os.environ.get("ACTUATOR_PORT", "8000"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 SEQUENCE_METADATA_FILENAME = "sequence.json"
+SEQUENCE_PREVIEW_STEMS = ("preview", "poster", "thumbnail", "cover", "_preview", "_poster", "_thumbnail")
+VIDEO_PREVIEW_MARKERS = (".preview", ".poster", ".thumbnail", ".cover", "_preview", "_poster", "_thumbnail")
 OUTSIDE_PLAYBACK_MODES = {"black", "hold"}
 MEDIA_IMPORT_TEMP_SUFFIXES = (".partial", ".tmp", ".incoming", ".copying")
 POSITION_TARGET_EPSILON_PCT = 0.05
@@ -214,6 +216,10 @@ def media_url_for(relative_path: str) -> str:
     return f"/media/{quote(relative_path, safe='/')}"
 
 
+def preview_url_for(relative_path: str, signature: str) -> str:
+    return f"{media_url_for(relative_path)}?v={quote(signature or 'preview')}"
+
+
 def camera_app_available() -> bool:
     return (CAMERA_APP_DIR / "index.html").is_file()
 
@@ -281,6 +287,7 @@ class SequenceItem:
     frame_count: int = 0
     frame_paths: list[str] = field(default_factory=list)
     media_url: str | None = None
+    preview_url: str | None = None
     content_signature: str = ""
     start_cm: float = 0.0
     volume_height_cm: float = LIFT_STROKE_CM
@@ -337,6 +344,7 @@ class SequenceItem:
             "relative_path": self.relative_path,
             "frame_count": self.frame_count,
             "media_url": self.media_url,
+            "preview_url": self.preview_url,
             "content_signature": self.content_signature,
             "lift_stroke_cm": LIFT_STROKE_CM,
             "start_cm": round(self.start_cm, 3),
@@ -376,6 +384,31 @@ class SequenceLibrary:
     def _is_import_temp_name(self, name: str) -> bool:
         clean = name.strip().lower()
         return clean.startswith(".") or clean.endswith(MEDIA_IMPORT_TEMP_SUFFIXES)
+
+    def _is_directory_preview_file(self, path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_EXTENSIONS and path.stem.strip().lower() in SEQUENCE_PREVIEW_STEMS
+
+    def _is_video_preview_sidecar(self, path: Path) -> bool:
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return False
+        stem = path.stem.strip().lower()
+        return any(stem.endswith(marker) for marker in VIDEO_PREVIEW_MARKERS)
+
+    def _preview_for_directory(self, directory: Path, filenames: list[str]) -> Path | None:
+        candidates = [directory / name for name in filenames if self._is_directory_preview_file(directory / name)]
+        priority = {stem: index for index, stem in enumerate(SEQUENCE_PREVIEW_STEMS)}
+        return (
+            sorted(candidates, key=lambda item: (priority.get(item.stem.lower(), 999), item.suffix.lower(), item.name.lower()))[0]
+            if candidates
+            else None
+        )
+
+    def _preview_for_video(self, file_path: Path) -> Path | None:
+        candidates: list[Path] = []
+        for marker in VIDEO_PREVIEW_MARKERS:
+            for suffix in sorted(IMAGE_EXTENSIONS):
+                candidates.append(file_path.with_name(f"{file_path.stem}{marker}{suffix}"))
+        return next((candidate for candidate in candidates if candidate.is_file()), None)
 
     def _metadata_for_directory(self, directory: Path) -> dict[str, Any]:
         return self._read_metadata(directory / SEQUENCE_METADATA_FILENAME)
@@ -449,6 +482,7 @@ class SequenceLibrary:
             directory_resolved = directory.resolve()
             rel_dir = "" if directory_resolved == root_resolved else directory_resolved.relative_to(root_resolved).as_posix()
             image_paths: list[str] = []
+            directory_preview_path = self._preview_for_directory(directory, filenames)
 
             for name in sorted(filenames):
                 if self._is_import_temp_name(name):
@@ -462,9 +496,18 @@ class SequenceLibrary:
                     metadata_path = file_path.with_suffix(".json")
                     if metadata_path.is_file():
                         signature_paths.append(metadata_path)
+                    preview_path = self._preview_for_video(file_path)
+                    if preview_path:
+                        signature_paths.append(preview_path)
                     metadata = self._metadata_for_video(file_path)
                     start_cm, height_cm, outside_playback = self._sequence_span(
                         metadata
+                    )
+                    content_signature = self._signature_for_paths(signature_paths)
+                    preview_url = (
+                        preview_url_for(preview_path.relative_to(self.root).as_posix(), content_signature)
+                        if preview_path
+                        else None
                     )
                     items[rel_path] = SequenceItem(
                         id=rel_path,
@@ -474,12 +517,15 @@ class SequenceLibrary:
                         relative_path=rel_path,
                         folder=self._folder_for_path(rel_path),
                         media_url=media_url_for(rel_path),
-                        content_signature=self._signature_for_paths(signature_paths),
+                        preview_url=preview_url,
+                        content_signature=content_signature,
                         start_cm=start_cm,
                         volume_height_cm=height_cm,
                         outside_playback=outside_playback,
                     )
                 elif suffix in IMAGE_EXTENSIONS:
+                    if self._is_directory_preview_file(file_path) or self._is_video_preview_sidecar(file_path):
+                        continue
                     image_paths.append(rel_path)
 
             if not image_paths:
@@ -491,9 +537,17 @@ class SequenceLibrary:
             metadata_path = directory / SEQUENCE_METADATA_FILENAME
             if metadata_path.is_file():
                 signature_paths.append(metadata_path)
+            if directory_preview_path:
+                signature_paths.append(directory_preview_path)
             metadata = self._metadata_for_directory(directory)
             start_cm, height_cm, outside_playback = self._sequence_span(
                 metadata
+            )
+            content_signature = self._signature_for_paths(signature_paths)
+            preview_url = (
+                preview_url_for(directory_preview_path.relative_to(self.root).as_posix(), content_signature)
+                if directory_preview_path
+                else None
             )
             items[sequence_id] = SequenceItem(
                 id=sequence_id,
@@ -504,7 +558,8 @@ class SequenceLibrary:
                 folder=self._folder_for_path(rel_dir),
                 frame_count=len(image_paths),
                 frame_paths=image_paths,
-                content_signature=self._signature_for_paths(signature_paths),
+                preview_url=preview_url,
+                content_signature=content_signature,
                 start_cm=start_cm,
                 volume_height_cm=height_cm,
                 outside_playback=outside_playback,
@@ -1060,6 +1115,18 @@ class InstallationController:
             return random.choice(choices)
         return ordered[(ordered.index(current) + step) % len(ordered)]
 
+    def _pick_library_sequence_id(self, step: int = 1) -> str | None:
+        ordered = self.library.ordered_ids()
+        if not ordered:
+            return None
+
+        with self.state_lock:
+            current = self.selected_sequence_id
+
+        if current not in ordered:
+            return ordered[0] if step >= 0 else ordered[-1]
+        return ordered[(ordered.index(current) + step) % len(ordered)]
+
     def _set_selected_sequence_id(self, sequence_id: str | None, persist: bool = True) -> None:
         with self.state_lock:
             self.selected_sequence_id = sequence_id
@@ -1534,6 +1601,7 @@ class InstallationController:
             "selected_sequence_kind": sequence.kind if sequence else None,
             "selected_sequence_frame_count": sequence.frame_count if sequence else 0,
             "selected_sequence_media_url": sequence.media_url if sequence else None,
+            "selected_sequence_preview_url": sequence.preview_url if sequence else None,
             "selected_sequence_start_cm": round(sequence.start_cm, 3) if sequence else 0.0,
             "selected_sequence_end_cm": round(sequence.end_cm, 3) if sequence else LIFT_STROKE_CM,
             "selected_sequence_volume_height_cm": round(sequence.volume_height_cm, 3) if sequence else LIFT_STROKE_CM,
@@ -2046,14 +2114,11 @@ class InstallationController:
 
         return False
 
-    def _advance_sequence(self, step: int = 1, randomize: bool = False, persist: bool = True) -> None:
-        self._set_selected_sequence_id(self._pick_advanced_sequence_id(step=step, randomize=randomize), persist=persist)
-
     def previous_sequence(self) -> None:
-        self._advance_sequence(step=-1)
+        self._set_selected_sequence_id(self._pick_library_sequence_id(step=-1))
 
     def next_sequence(self) -> None:
-        self._advance_sequence(step=1)
+        self._set_selected_sequence_id(self._pick_library_sequence_id(step=1))
 
     def _cycle_loop(self, cycle_token: int) -> None:
         cycle_end_reason: str | None = None
