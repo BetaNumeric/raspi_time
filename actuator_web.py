@@ -212,6 +212,16 @@ def frame_stride_for_sequence(sequence: "SequenceItem", direction: int, duty: fl
     return stride, requested_fps, duration_sec
 
 
+def natural_sort_key(value: str) -> tuple[tuple[int, Any], ...]:
+    key: list[tuple[int, Any]] = []
+    for part in re.split(r"(\d+)", value.casefold()):
+        if not part:
+            continue
+        key.append((1, int(part)) if part.isdigit() else (0, part))
+    key.append((2, value.casefold()))
+    return tuple(key)
+
+
 def media_url_for(relative_path: str) -> str:
     return f"/media/{quote(relative_path, safe='/')}"
 
@@ -477,14 +487,14 @@ class SequenceLibrary:
 
         for current_dir, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [name for name in dirnames if not self._is_import_temp_name(name)]
-            dirnames.sort()
+            dirnames.sort(key=natural_sort_key)
             directory = Path(current_dir)
             directory_resolved = directory.resolve()
             rel_dir = "" if directory_resolved == root_resolved else directory_resolved.relative_to(root_resolved).as_posix()
             image_paths: list[str] = []
             directory_preview_path = self._preview_for_directory(directory, filenames)
 
-            for name in sorted(filenames):
+            for name in sorted(filenames, key=natural_sort_key):
                 if self._is_import_temp_name(name):
                     continue
                 file_path = directory / name

@@ -48,6 +48,10 @@ The controller groups sequences by folder, so these appear under `astronomy`
 and `objects`. A `sequence.json` or video sidecar can also set `"name"` to
 override the displayed sequence name.
 
+Image frames are sorted in natural numeric order, so zero-padded names like
+`0001.png`, `0002.png`, `0010.png` and Windows-style names like `(1).png`,
+`(2).png`, `(10).png` play in counting order.
+
 To add a controller preview image for an image-sequence folder, place a file
 named `preview`, `poster`, `thumbnail`, or `cover` with an image extension in
 that folder, for example `preview.png` or `poster.jpg`. These files are ignored
