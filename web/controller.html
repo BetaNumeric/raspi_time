@@ -2846,6 +2846,11 @@
         }
 
         async function applyState(state) {
+            if (typeof state.jog_epoch === "string" && state.jog_epoch === currentState?.jog_epoch
+                && Number.isInteger(state.jog_generation) && Number.isInteger(currentState?.jog_generation)) {
+                // Keep generations ordered within one server lifetime; a restart resets them.
+                state.jog_generation = Math.max(state.jog_generation, currentState.jog_generation);
+            }
             currentState = state;
             renderStatus(state);
             syncFormFromState(state);
@@ -2956,22 +2961,116 @@
             }
         }
 
+        const JOG_HEARTBEAT_MS = 200;
+        let activeJogHold = null;
+        let jogSessionCounter = 0;
+        let pendingJogStops = Promise.resolve();
+
+        function sendJogStop(hold, keepalive = false) {
+            const payload = { action: "jog_stop", session_id: hold.sessionId };
+            let request;
+            if (keepalive) {
+                // Allow the release request to outlive a page that is closing.
+                request = fetch("/api/action", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                    keepalive: true
+                }).then(async (response) => {
+                    if (!response.ok) return;
+                    const result = await response.json();
+                    if (result.state) await applyState(result.state);
+                });
+            } else {
+                request = postAction(payload.action, { session_id: hold.sessionId });
+            }
+            pendingJogStops = Promise.all([pendingJogStops, request.catch(() => {})]).then(() => {});
+        }
+
+        function stopJogHold(hold = activeJogHold, keepalive = false) {
+            if (!hold || hold.ended) return;
+            hold.ended = true;
+            clearTimeout(hold.timer);
+            if (activeJogHold === hold) activeJogHold = null;
+            try {
+                if (hold.button.hasPointerCapture(hold.pointerId)) {
+                    hold.button.releasePointerCapture(hold.pointerId);
+                }
+            } catch (error) {}
+            // Send Stop even if Start has not replied or its response was lost.
+            sendJogStop(hold, keepalive);
+        }
+
+        async function renewJogHold(hold) {
+            if (activeJogHold !== hold || hold.ended) return;
+            try {
+                // Heartbeats do not wait for preview loading or render state.
+                await apiPost("/api/action", { action: "jog_heartbeat", session_id: hold.sessionId });
+                if (activeJogHold === hold && !hold.ended) {
+                    hold.timer = setTimeout(() => renewJogHold(hold), JOG_HEARTBEAT_MS);
+                }
+            } catch (error) {
+                stopJogHold(hold);
+            }
+        }
+
         function bindJogButton(button, direction) {
-            let active = false;
-            const stop = async () => {
-                if (!active) return;
-                active = false;
-                try { await postAction("jog_stop"); } catch (error) {}
-            };
-            button.addEventListener("pointerdown", async (event) => {
+            button.addEventListener("pointerdown", (event) => {
+                if (event.button !== 0 || activeJogHold?.pointerId === event.pointerId) return;
                 event.preventDefault();
-                active = true;
-                try { await postAction("jog_start", { direction }); } catch (error) { active = false; }
+                stopJogHold();
+                const hold = {
+                    button,
+                    pointerId: event.pointerId,
+                    sessionId: `${Date.now().toString(36)}-${++jogSessionCounter}-${Math.random().toString(36).slice(2)}`,
+                    timer: null,
+                    ended: false
+                };
+                activeJogHold = hold;
+                try {
+                    button.setPointerCapture(event.pointerId);
+                } catch (error) {
+                    stopJogHold(hold);
+                    return;
+                }
+                // Finish earlier releases before choosing the generation for a new hold.
+                pendingJogStops.then(() => {
+                    if (activeJogHold !== hold || hold.ended) return null;
+                    const generation = currentState?.jog_generation;
+                    const epoch = currentState?.jog_epoch;
+                    if (!Number.isInteger(generation) || typeof epoch !== "string" || !epoch) {
+                        throw new Error("Jog state is unavailable");
+                    }
+                    return apiPost("/api/action", { action: "jog_start", direction, session_id: hold.sessionId, generation, epoch });
+                })
+                    .then((result) => {
+                        if (!result) return;
+                        if (activeJogHold !== hold || hold.ended) {
+                            // A delayed Start reply must never revive a released hold.
+                            sendJogStop(hold);
+                            return;
+                        }
+                        hold.timer = setTimeout(() => renewJogHold(hold), JOG_HEARTBEAT_MS);
+                        if (result.state) applyState(result.state).catch(() => {});
+                    })
+                    .catch(() => stopJogHold(hold));
             });
+            const stop = (event) => {
+                if (activeJogHold?.button === button && activeJogHold.pointerId === event.pointerId) {
+                    stopJogHold();
+                }
+            };
             button.addEventListener("pointerup", stop);
             button.addEventListener("pointercancel", stop);
             button.addEventListener("pointerleave", stop);
+            button.addEventListener("lostpointercapture", stop);
         }
+
+        window.addEventListener("blur", () => stopJogHold(activeJogHold, true));
+        window.addEventListener("pagehide", () => stopJogHold(activeJogHold, true));
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState !== "visible") stopJogHold(activeJogHold, true);
+        });
 
         targetRange.addEventListener("input", () => {
             if (targetRange.disabled) return;

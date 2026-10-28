@@ -147,6 +147,37 @@ handed to MPV as sampled frame lists capped at 30 fps by default; change that
 cap with `TIME_VOLUME_MPV_FPS_CAP=24` if needed. If MPV is missing or fails to
 start, the launcher falls back to the web display at `/display`.
 
+## Motion Control Safeguards
+
+Stop cancels both active motion and workers that have not started yet. Movement,
+homing, and GPIO cleanup validate their motion session before changing outputs,
+so cancelled workers cannot restart the lift or interfere with a newer movement.
+Shutdown disables the motor outputs and prevents further motion reservations.
+
+The controller's press-and-hold Jog buttons renew a one-second lease every 200 ms.
+If the page closes, loses focus, or loses its connection, jogging stops when that
+lease expires. The physical toggle switch does not depend on browser heartbeats.
+After updating, restart the server and reload controller pages together. Custom
+clients using Jog must send the current `jog_epoch`, `jog_generation`, and a unique
+hold identifier as `epoch`, `generation`, and `session_id` with `jog_start`, renew
+with `jog_heartbeat`, and release with `jog_stop` using the same `session_id`.
+
+Position is still estimated from running time; this change does not add position
+feedback or verify that timed homing physically reached the bottom.
+
+Run the hardware-free regressions with:
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+With Chromium installed, the optional browser regressions also exercise the Jog
+JavaScript using mocked requests and a temporary browser profile:
+
+```bash
+TIME_VOLUME_TEST_BROWSER=1 python3 -B -m unittest discover -s tests -v
+```
+
 ## Camera App
 
 The camera app is hosted separately on GitHub Pages:

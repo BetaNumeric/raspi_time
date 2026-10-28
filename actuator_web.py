@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -70,6 +71,7 @@ SW_RETRACT_IN = 5
 SW_ACTIVE_LOW = True
 SW_POLL_MS = 30
 SW_DEBOUNCE_SAMPLES = 2
+JOG_LEASE_SEC = 1.0
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -115,6 +117,8 @@ MPV_IMAGE_END_DRIFT_SEEK_THRESHOLD_SEC = 0.035
 MPV_IMAGE_BACKWARD_DRIFT_SEEK_THRESHOLD_SEC = 0.24
 MPV_IMAGE_END_SYNC_RATIO = 0.96
 MPV_SEQUENCE_END_GRACE_CM = 0.18
+# Bump when image frame ordering or playlist contents change.
+MPV_IMAGE_PLAYLIST_CACHE_VERSION = 2
 DEFAULT_DISPLAY_BACKEND = "mpv"
 AUTO_START_CYCLE_ON_BOOT_DEFAULT = False
 AUTO_START_CYCLE_DELAY_SEC_DEFAULT = 120.0
@@ -606,6 +610,13 @@ class SequenceLibrary:
             return self._items.get(item_id)
 
 
+@dataclass
+class MotionSession:
+    token: int
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    lease_deadline: float | None = None
+
+
 class ActuatorHardware:
     def __init__(self, req: Any):
         self.req = req
@@ -617,6 +628,8 @@ class ActuatorHardware:
         self.io_lock = threading.Lock()
         self.motion_stop_event = threading.Event()
         self.motion_token = 0
+        self.motion_session: MotionSession | None = None
+        self.closed = False
 
     def _set_line_value(self, line: int, value: Any, ignore_errors: bool = False) -> None:
         if not self.req or gpiod is None:
@@ -635,30 +648,67 @@ class ActuatorHardware:
         with self.io_lock:
             return self.req.get_value(line)
 
-    def _deactivate_outputs(self, ignore_errors: bool = False) -> None:
-        if not self.req or gpiod is None:
-            return
-        self._set_line_value(RPWM, gpiod.line.Value.INACTIVE, ignore_errors=ignore_errors)
-        self._set_line_value(LPWM, gpiod.line.Value.INACTIVE, ignore_errors=ignore_errors)
+    def _disable_outputs(self, ignore_errors: bool = False) -> None:
+        # One broken GPIO must not prevent the remaining outputs being disabled.
+        error = None
+        if self.req and gpiod is not None:
+            for pin in (REN, LEN, RPWM, LPWM):
+                try:
+                    self._set_line_value(pin, gpiod.line.Value.INACTIVE)
+                except Exception as exc:
+                    if error is None:
+                        error = exc
+        if error is not None and not ignore_errors:
+            raise error
 
-    def _begin_motion_session(self, clear_paused: bool = False) -> tuple[threading.Event, int]:
+    def reserve_motion(self, clear_paused: bool = False, lease_timeout: float | None = None) -> MotionSession | None:
+        # Reserve before launching a worker. Stop can then cancel even work that
+        # has not reached its first instruction. Lock order is lock -> io_lock.
         with self.lock:
+            if self.closed:
+                return None
             self.motion_stop_event.set()
             self.motion_token += 1
-            token = self.motion_token
-            stop_event = threading.Event()
-            self.motion_stop_event = stop_event
+            self.is_moving = False
+            self._disable_outputs()
+            session = MotionSession(
+                self.motion_token,
+                lease_deadline=time.monotonic() + lease_timeout if lease_timeout is not None else None,
+            )
+            self.motion_session = session
+            self.motion_stop_event = session.stop_event
             self.is_moving = True
             if clear_paused:
                 self.is_paused = False
-        return stop_event, token
+            return session
 
-    def _finish_motion_session(self, token: int, stop_event: threading.Event) -> bool:
+    def _session_is_current(self, session: MotionSession) -> bool:
+        # Caller owns self.lock, including during the GPIO write it authorizes.
+        return (
+            not self.closed
+            and self.motion_session is session
+            and self.motion_token == session.token
+            and not session.stop_event.is_set()
+            and (session.lease_deadline is None or time.monotonic() < session.lease_deadline)
+        )
+
+    def renew_motion(self, session: MotionSession, lease_timeout: float) -> bool:
         with self.lock:
-            if token != self.motion_token or self.motion_stop_event is not stop_event:
+            if not self.is_moving or not self._session_is_current(session):
                 return False
-            self.is_moving = False
+            session.lease_deadline = time.monotonic() + lease_timeout
             return True
+
+    def _finish_motion_session(self, session: MotionSession, homed: bool = False) -> None:
+        with self.lock:
+            if self.motion_session is not session or self.motion_token != session.token:
+                return
+            # Validation and cleanup share the gate with Stop and new sessions.
+            # An old worker must never disable a newer worker's outputs.
+            if homed and self._session_is_current(session):
+                self.position_pct = 0.0
+            self.is_moving = False
+            self._disable_outputs(ignore_errors=True)
 
     def enable(self, on: bool = True, ignore_errors: bool = False) -> None:
         if not self.req or gpiod is None:
@@ -670,7 +720,17 @@ class ActuatorHardware:
     def stop_pwm(self, ignore_errors: bool = False) -> None:
         with self.lock:
             self.motion_stop_event.set()
-        self._deactivate_outputs(ignore_errors=ignore_errors)
+            self.motion_token += 1
+            self.is_moving = False
+            self._disable_outputs(ignore_errors=ignore_errors)
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            self.motion_stop_event.set()
+            self.motion_token += 1
+            self.is_moving = False
+            self._disable_outputs(ignore_errors=True)
 
     def pause(self) -> None:
         with self.lock:
@@ -688,60 +748,68 @@ class ActuatorHardware:
         duration: float,
         update_callback: Any = None,
         stop_condition: Any = None,
-    ) -> None:
-        stop_event, motion_token = self._begin_motion_session()
-        self.enable(True)
-
-        other_pin = LPWM if pin == RPWM else RPWM
-        if self.req and gpiod is not None:
-            self._set_line_value(other_pin, gpiod.line.Value.INACTIVE)
-
+        *,
+        session: MotionSession,
+        full_speed: bool = False,
+        home_on_completion: bool = False,
+    ) -> bool:
         period = 1.0 / PWM_HZ
-        start_time = time.time()
+        start_time = time.monotonic()
         last_tick = start_time
-
+        completed = False
         try:
-            while time.time() - start_time < duration:
-                if stop_event.is_set():
-                    break
-
-                effective_duty = clamp(self.current_duty, 0.0, 1.0)
-                t_on = period * effective_duty
-                t_off = period - t_on
-
+            # Include setup in cleanup coverage: a failed enable/write must
+            # leave the other outputs disabled too.
+            with self.lock:
+                if not self._session_is_current(session):
+                    return False
                 if self.req and gpiod is not None:
-                    if t_on > 0:
+                    other_pin = LPWM if pin == RPWM else RPWM
+                    self._set_line_value(other_pin, gpiod.line.Value.INACTIVE)
+                self.enable(True)
+
+            while time.monotonic() - start_time < duration:
+                with self.lock:
+                    if not self._session_is_current(session):
+                        return False
+                    effective_duty = 1.0 if full_speed else clamp(self.current_duty, 0.0, 1.0)
+                    t_on = period * effective_duty
+                    t_off = period - t_on
+                    if self.req and gpiod is not None and t_on > 0:
                         self._set_line_value(pin, gpiod.line.Value.ACTIVE)
-                        time.sleep(t_on)
-                    self._set_line_value(pin, gpiod.line.Value.INACTIVE)
-                    if t_off > 0:
-                        time.sleep(t_off)
-                else:
-                    time.sleep(period)
+                session.stop_event.wait(t_on)
+                with self.lock:
+                    if not self._session_is_current(session):
+                        return False
+                    if self.req and gpiod is not None:
+                        self._set_line_value(pin, gpiod.line.Value.INACTIVE)
+                if t_off > 0:
+                    session.stop_event.wait(t_off)
 
-                if stop_event.is_set():
-                    break
-
-                now = time.time()
+                now = time.monotonic()
                 dt = now - last_tick
                 last_tick = now
-
                 if update_callback:
                     update_callback(dt)
-
                 if stop_condition and stop_condition():
-                    break
+                    return True
+            with self.lock:
+                completed = self._session_is_current(session)
+                return completed
         finally:
-            if self._finish_motion_session(motion_token, stop_event):
-                self._deactivate_outputs(ignore_errors=True)
-                self.enable(False, ignore_errors=True)
+            self._finish_motion_session(session, homed=home_on_completion and completed)
 
-    def move_diff(self, delta_pct: float, duty: float = 1.0) -> None:
+    def move_diff(self, delta_pct: float, duty: float = 1.0, *, session: MotionSession) -> None:
         if abs(delta_pct) < 0.01:
+            self._finish_motion_session(session)
             return
 
         with self.lock:
+            valid = self._session_is_current(session)
             start_pct = self.position_pct
+        if not valid:
+            self._finish_motion_session(session)
+            return
         target_pct = clamp(start_pct + delta_pct, 0.0, 100.0)
 
         pin = RPWM if delta_pct > 0 else LPWM
@@ -752,7 +820,8 @@ class ActuatorHardware:
             effective_duty = max(0.1, self.current_duty)
             speed_pct_per_sec = (100.0 / stroke_sec) * effective_duty * direction
             with self.lock:
-                self.position_pct = clamp(self.position_pct + speed_pct_per_sec * dt, 0.0, 100.0)
+                if self._session_is_current(session):
+                    self.position_pct = clamp(self.position_pct + speed_pct_per_sec * dt, 0.0, 100.0)
 
         def stop_condition() -> bool:
             with self.lock:
@@ -761,10 +830,11 @@ class ActuatorHardware:
                 return current >= target_pct - POSITION_TARGET_EPSILON_PCT
             return current <= target_pct + POSITION_TARGET_EPSILON_PCT
 
-        self._soft_pwm_loop(pin, duty, 3600.0, update_position, stop_condition)
+        self._soft_pwm_loop(pin, duty, 3600.0, update_position, stop_condition, session=session)
 
-    def manual_move(self, direction: int, duty: float = 1.0) -> None:
+    def manual_move(self, direction: int, duty: float = 1.0, *, session: MotionSession) -> None:
         if direction == 0:
+            self._finish_motion_session(session)
             return
 
         pin = RPWM if direction > 0 else LPWM
@@ -774,41 +844,17 @@ class ActuatorHardware:
             effective_duty = max(0.1, self.current_duty)
             speed_pct_per_sec = (100.0 / stroke_sec) * effective_duty * direction
             with self.lock:
-                self.position_pct = clamp(self.position_pct + speed_pct_per_sec * dt, 0.0, 100.0)
+                if self._session_is_current(session):
+                    self.position_pct = clamp(self.position_pct + speed_pct_per_sec * dt, 0.0, 100.0)
 
-        self._soft_pwm_loop(pin, duty, 3600.0, update_position)
+        self._soft_pwm_loop(pin, duty, 3600.0, update_position, session=session)
 
-    def home(self) -> None:
-        stop_event, motion_token = self._begin_motion_session(clear_paused=True)
-        self.enable(True)
+    def home(self, *, session: MotionSession) -> None:
+        self._soft_pwm_loop(LPWM, 1.0, HOME_TIMEOUT_SEC, session=session, full_speed=True, home_on_completion=True)
 
-        if self.req and gpiod is not None:
-            self._set_line_value(RPWM, gpiod.line.Value.INACTIVE)
 
-        period = 1.0 / PWM_HZ
-        start_time = time.time()
-        reached_home = False
-        try:
-            while time.time() - start_time < HOME_TIMEOUT_SEC:
-                if stop_event.is_set():
-                    break
-                if self.req and gpiod is not None:
-                    self._set_line_value(LPWM, gpiod.line.Value.ACTIVE)
-                    time.sleep(period)
-                    self._set_line_value(LPWM, gpiod.line.Value.INACTIVE)
-                else:
-                    time.sleep(period)
-                if stop_event.is_set():
-                    break
-            else:
-                reached_home = True
-        finally:
-            if self._finish_motion_session(motion_token, stop_event):
-                self._deactivate_outputs(ignore_errors=True)
-                self.enable(False, ignore_errors=True)
-                if reached_home:
-                    with self.lock:
-                        self.position_pct = 0.0
+class JogConflictError(ValueError):
+    pass
 
 
 class InstallationController:
@@ -822,8 +868,14 @@ class InstallationController:
         self.state_lock = threading.Lock()
         self.settings_io_lock = threading.Lock()
         self.settings_timer_lock = threading.Lock()
-        self.command_lock = threading.Lock()
+        # Public commands compose (e.g. switch override stops cycle mode). Keep
+        # that serialization separate from the non-reentrant hardware gate.
+        self.command_lock = threading.RLock()
         self.shutdown_event = threading.Event()
+        self.jog_epoch = os.urandom(16).hex()
+        self.jog_generation = 0
+        self.jog_session_id: str | None = None
+        self.jog_motion: MotionSession | None = None
 
         self.target_pct = 0.0
         self.delay_sec = 0
@@ -1073,6 +1125,8 @@ class InstallationController:
 
     def start_mpv_display(self, display_env: dict[str, str] | None = None, force_restart: bool = False) -> bool:
         with self.display_backend_lock:
+            if self.shutdown_event.is_set():
+                return False
             clean_display_env = normalized_mpv_display_env(display_env)
             if clean_display_env:
                 self.mpv_display_env.update(clean_display_env)
@@ -1536,6 +1590,7 @@ class InstallationController:
             qr_sync_guard_sec = round(self.qr_sync_guard_sec, 2)
             display_backend_mode = self.display_backend_mode
             display_backend_status = self.display_backend_status
+            jog_generation = self.jog_generation
             cycle_order_ids = list(self.cycle_order_ids)
             cycle_disabled_ids = set(self.cycle_disabled_ids)
 
@@ -1603,6 +1658,8 @@ class InstallationController:
             "active_target_pct": active_target,
             "switch_direction": switch_direction,
             "switch_label": self._switch_label(switch_direction),
+            "jog_generation": jog_generation,
+            "jog_epoch": self.jog_epoch,
             "last_runtime_error": last_runtime_error,
             "selected_sequence_id": selected_sequence_id,
             "selected_sequence_name": sequence.name if sequence else None,
@@ -1717,25 +1774,50 @@ class InstallationController:
             if token == self.movement_token:
                 self.active_target = None
 
-    def _move_worker(self, delta_pct: float, duty: float, token: int) -> None:
+    def _invalidate_jog(self) -> None:
+        # Caller holds command_lock. The generation also cancels delayed HTTP
+        # starts whose release/Stop was processed before their Start request.
+        with self.state_lock:
+            self.jog_generation += 1
+        self.jog_session_id = None
+        self.jog_motion = None
+
+    def _reserve_motion(self, lease_timeout: float | None = None) -> MotionSession | None:
+        if self.shutdown_event.is_set():
+            return None
+        self._invalidate_jog()
+        return self.hardware.reserve_motion(clear_paused=True, lease_timeout=lease_timeout)
+
+    def _launch_motion_worker(self, target: Any, args: tuple[Any, ...], session: MotionSession) -> None:
         try:
-            self.hardware.move_diff(delta_pct, duty)
+            threading.Thread(target=target, args=args, kwargs={"session": session}, daemon=True).start()
+        except Exception:
+            self.hardware._finish_motion_session(session)
+            raise
+
+    def _move_worker(self, delta_pct: float, duty: float, token: int, *, session: MotionSession) -> None:
+        try:
+            self.hardware.move_diff(delta_pct, duty, session=session)
         except Exception as exc:
             self._set_runtime_error(str(exc))
             print(f"Movement stopped due to error: {exc}")
         finally:
             self._clear_target_movement(token)
 
-    def _manual_move_worker(self, direction: int, duty: float, source: str = "manual") -> None:
+    def _manual_move_worker(self, direction: int, duty: float, source: str = "manual", *, session: MotionSession) -> None:
         try:
-            self.hardware.manual_move(direction, duty)
+            self.hardware.manual_move(direction, duty, session=session)
         except Exception as exc:
             self._set_runtime_error(str(exc))
             print(f"{source.capitalize()} move stopped due to error: {exc}")
+        finally:
+            with self.command_lock:
+                if self.jog_motion is session:
+                    self._invalidate_jog()
 
-    def _home_worker(self) -> None:
+    def _home_worker(self, *, session: MotionSession) -> None:
         try:
-            self.hardware.home()
+            self.hardware.home(session=session)
         except Exception as exc:
             self._set_runtime_error(str(exc))
             print(f"Home stopped due to error: {exc}")
@@ -1745,39 +1827,42 @@ class InstallationController:
             return self.countdown_deadline is not None
 
     def start_cycle_countdown(self, seconds: float, remember_delay: bool = False) -> None:
-        delay_seconds = max(0.0, float(seconds))
-        if remember_delay:
+        with self.command_lock:
+            if self.shutdown_event.is_set():
+                return
+            delay_seconds = max(0.0, float(seconds))
+            if remember_delay:
+                with self.state_lock:
+                    self.delay_sec = max(0, int(round(delay_seconds)))
+                self._save_settings()
             with self.state_lock:
-                self.delay_sec = max(0, int(round(delay_seconds)))
-            self._save_settings()
-
-        with self.state_lock:
-            if self.is_cycling:
-                return
-
-        with self.hardware.lock:
-            if self.hardware.is_moving:
-                return
-
-        self.start_countdown(delay_seconds, action="cycle")
+                if self.is_cycling:
+                    return
+            with self.hardware.lock:
+                if self.hardware.is_moving:
+                    return
+            self.start_countdown(delay_seconds, action="cycle")
 
     def start_countdown(self, seconds: float, action: str = "movement") -> None:
-        self.cancel_countdown()
-        if seconds <= 0:
-            if action == "cycle":
-                self._start_cycle_from_countdown()
-            else:
-                self.execute_movement()
-            return
-        event = threading.Event()
-        deadline = time.time() + seconds
-        with self.state_lock:
-            self.countdown_token += 1
-            token = self.countdown_token
-            self.countdown_deadline = deadline
-            self.countdown_event = event
-            self.countdown_action = action if action in {"movement", "cycle"} else "movement"
-        threading.Thread(target=self._countdown_worker, args=(event, token), daemon=True).start()
+        with self.command_lock:
+            if self.shutdown_event.is_set():
+                return
+            self.cancel_countdown()
+            if seconds <= 0:
+                if action == "cycle":
+                    self._start_cycle_from_countdown()
+                else:
+                    self.execute_movement()
+                return
+            event = threading.Event()
+            deadline = time.time() + seconds
+            with self.state_lock:
+                self.countdown_token += 1
+                token = self.countdown_token
+                self.countdown_deadline = deadline
+                self.countdown_event = event
+                self.countdown_action = action if action in {"movement", "cycle"} else "movement"
+            threading.Thread(target=self._countdown_worker, args=(event, token), daemon=True).start()
 
     def _countdown_worker(self, event: threading.Event, token: int) -> None:
         while not event.is_set():
@@ -1871,27 +1956,29 @@ class InstallationController:
             self._set_selected_sequence_id(None, persist=False)
 
     def execute_movement(self) -> None:
-        if self.is_switch_override_active():
-            return
+        with self.command_lock:
+            if self.is_switch_override_active() or self.shutdown_event.is_set():
+                return
 
-        with self.state_lock:
-            target = self.target_pct
-            duty = self.speed_duty
-            self.last_cycle_end_reason = None
-            self.last_runtime_error = None
-
-        with self.hardware.lock:
-            current = self.hardware.position_pct
-
-        delta = target - current
-        if abs(delta) < POSITION_TARGET_EPSILON_PCT:
             with self.state_lock:
-                self.active_target = None
-            return
+                target = self.target_pct
+                duty = self.speed_duty
+                self.last_cycle_end_reason = None
+                self.last_runtime_error = None
 
-        self.hardware.resume()
-        token = self._begin_target_movement(target)
-        threading.Thread(target=self._move_worker, args=(delta, duty, token), daemon=True).start()
+            with self.hardware.lock:
+                current = self.hardware.position_pct
+
+            delta = target - current
+            if abs(delta) < POSITION_TARGET_EPSILON_PCT:
+                with self.state_lock:
+                    self.active_target = None
+                return
+
+            session = self._reserve_motion()
+            if session is not None:
+                token = self._begin_target_movement(target)
+                self._launch_motion_worker(self._move_worker, (delta, duty, token), session)
 
     def _execute_movement_from_countdown(self, countdown_token: int) -> None:
         with self.command_lock:
@@ -1901,34 +1988,36 @@ class InstallationController:
             self.execute_movement()
 
     def restart_movement(self, new_target: float) -> None:
-        if self.is_switch_override_active():
+        with self.command_lock:
+            if self.is_switch_override_active() or self.shutdown_event.is_set():
+                with self.state_lock:
+                    self.active_target = None
+                return
+
+            self.hardware.stop_pwm()
+            time.sleep(0.1)
+
+            with self.hardware.lock:
+                current = self.hardware.position_pct
+            delta = new_target - current
+            if abs(delta) < POSITION_TARGET_EPSILON_PCT:
+                with self.state_lock:
+                    self.active_target = None
+                return
+
             with self.state_lock:
-                self.active_target = None
-            return
+                duty = self.speed_duty
+                self.last_cycle_end_reason = None
+                self.last_runtime_error = None
 
-        self.hardware.stop_pwm()
-        time.sleep(0.1)
-
-        with self.hardware.lock:
-            current = self.hardware.position_pct
-        delta = new_target - current
-        if abs(delta) < POSITION_TARGET_EPSILON_PCT:
-            with self.state_lock:
-                self.active_target = None
-            return
-
-        with self.state_lock:
-            duty = self.speed_duty
-            self.last_cycle_end_reason = None
-            self.last_runtime_error = None
-
-        self.hardware.resume()
-        token = self._begin_target_movement(new_target)
-        threading.Thread(target=self._move_worker, args=(delta, duty, token), daemon=True).start()
+            session = self._reserve_motion()
+            if session is not None:
+                token = self._begin_target_movement(new_target)
+                self._launch_motion_worker(self._move_worker, (delta, duty, token), session)
 
     def play_pause(self) -> None:
         with self.command_lock:
-            if self.is_switch_override_active():
+            if self.is_switch_override_active() or self.shutdown_event.is_set():
                 with self.state_lock:
                     self.active_target = None
                 return
@@ -1952,9 +2041,7 @@ class InstallationController:
                     with self.state_lock:
                         self.is_cycle_paused = True
                         self.last_runtime_error = None
-                    with self.hardware.lock:
-                        if self.hardware.is_moving:
-                            self.hardware.pause()
+                    self.hardware.pause()
                 return
 
             with self.hardware.lock:
@@ -1974,26 +2061,30 @@ class InstallationController:
             self.execute_movement()
 
     def stop_cycle(self, reason: str = "stopped") -> None:
-        with self.state_lock:
-            self.cycle_token += 1
-            self.is_cycling = False
-            self.is_cycle_paused = False
-            self.active_target = None
-            self.cycle_pause_phase = None
-            self.cycle_pause_deadline = None
-            self.cycle_pending_sequence_id = None
-            self.cycle_pending_direction = None
-            self.last_cycle_end_reason = reason
-        self.hardware.stop_pwm()
+        with self.command_lock:
+            self._invalidate_jog()
+            with self.state_lock:
+                self.cycle_token += 1
+                self.is_cycling = False
+                self.is_cycle_paused = False
+                self.active_target = None
+                self.cycle_pause_phase = None
+                self.cycle_pause_deadline = None
+                self.cycle_pending_sequence_id = None
+                self.cycle_pending_direction = None
+                self.last_cycle_end_reason = reason
+            self.hardware.stop_pwm()
 
     def _start_cycle_now_locked(self) -> None:
-        if self.is_switch_override_active():
+        if self.is_switch_override_active() or self.shutdown_event.is_set():
             return
         with self.hardware.lock:
             if self.hardware.is_moving:
                 return
 
-        if not self._wait_for_cycle_thread():
+        # The old thread may need command_lock to finish. Never wait for it
+        # while holding that lock; the next request can start once it exits.
+        if not self._wait_for_cycle_thread(timeout=0.0):
             with self.state_lock:
                 self.last_cycle_end_reason = "previous cycle still stopping"
             return
@@ -2105,10 +2196,16 @@ class InstallationController:
             if abs(delta) < POSITION_TARGET_EPSILON_PCT:
                 return True
 
-            self.hardware.resume()
-            token = self._begin_target_movement(target_pct)
+            with self.command_lock:
+                with self.state_lock:
+                    if cycle_token != self.cycle_token or not self.is_cycling or self.is_cycle_paused:
+                        continue
+                session = self._reserve_motion()
+                if session is None:
+                    return False
+                token = self._begin_target_movement(target_pct)
             try:
-                self.hardware.move_diff(delta, duty)
+                self.hardware.move_diff(delta, duty, session=session)
             finally:
                 self._clear_target_movement(token)
 
@@ -2174,78 +2271,106 @@ class InstallationController:
             cycle_end_reason = f"error: {exc}"
             print(f"Cycle loop stopped due to error: {exc}")
         finally:
-            with self.state_lock:
-                if self.cycle_thread is threading.current_thread():
-                    self.cycle_thread = None
-                is_current_cycle = cycle_token == self.cycle_token
+            with self.command_lock:
+                with self.state_lock:
+                    if self.cycle_thread is threading.current_thread():
+                        self.cycle_thread = None
+                    is_current_cycle = cycle_token == self.cycle_token
+                    if is_current_cycle:
+                        if cycle_end_reason is not None:
+                            self.last_cycle_end_reason = cycle_end_reason
+                        self.is_cycling = False
+                        self.is_cycle_paused = False
+                        self.active_target = None
+                        self.cycle_pause_phase = None
+                        self.cycle_pause_deadline = None
+                        self.cycle_pending_sequence_id = None
+                        self.cycle_pending_direction = None
                 if is_current_cycle:
-                    if cycle_end_reason is not None:
-                        self.last_cycle_end_reason = cycle_end_reason
-                    self.is_cycling = False
-                    self.is_cycle_paused = False
-                    self.active_target = None
-                    self.cycle_pause_phase = None
-                    self.cycle_pause_deadline = None
-                    self.cycle_pending_sequence_id = None
-                    self.cycle_pending_direction = None
+                    self.hardware.stop_pwm(ignore_errors=True)
             if is_current_cycle:
-                self.hardware.stop_pwm()
                 self._save_settings()
 
-    def start_jog(self, direction: int) -> None:
-        if direction == 0 or self.is_switch_override_active():
-            return
-        with self.hardware.lock:
-            if self.hardware.is_moving:
-                return
-        self.cancel_countdown()
-        with self.state_lock:
-            self.active_target = None
-            self.cycle_pause_phase = None
-            self.cycle_pause_deadline = None
-            self.cycle_pending_sequence_id = None
-            self.cycle_pending_direction = None
-            self.last_cycle_end_reason = None
-            self.last_runtime_error = None
-        self.hardware.resume()
-        threading.Thread(target=self._manual_move_worker, args=(direction, self.speed_duty, "manual"), daemon=True).start()
+    def _validate_jog_id(self, session_id: Any) -> str:
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            raise ValueError("A jog session_id of 1-128 characters is required; reload the controller")
+        return session_id
 
-    def stop_jog(self) -> None:
-        self.hardware.stop_pwm()
+    def start_jog(self, direction: int, session_id: str, generation: int, epoch: str) -> None:
+        session_id = self._validate_jog_id(session_id)
+        if direction not in (-1, 1):
+            raise ValueError("Jog direction must be -1 or 1")
+        with self.command_lock:
+            with self.state_lock:
+                if epoch != self.jog_epoch or type(generation) is not int or generation != self.jog_generation:
+                    raise JogConflictError("Jog start was cancelled; release and press again")
+            if self.shutdown_event.is_set() or self.is_switch_override_active():
+                raise JogConflictError("Manual jogging is unavailable")
+            if self.jog_motion is not None:
+                raise JogConflictError("The previous jog is still stopping")
+            with self.hardware.lock:
+                if self.hardware.is_moving:
+                    raise JogConflictError("The lift is already moving")
+            # Manual commands during a cycle's rest must cancel that cycle too.
+            self.stop_cycle("manual jog")
+            self.cancel_countdown()
+            with self.state_lock:
+                self.last_cycle_end_reason = None
+                self.last_runtime_error = None
+            session = self._reserve_motion(lease_timeout=JOG_LEASE_SEC)
+            if session is None:
+                raise JogConflictError("Controller is shutting down")
+            self.jog_session_id = session_id
+            self.jog_motion = session
+            self._launch_motion_worker(self._manual_move_worker, (direction, self.speed_duty, "manual"), session)
+
+    def heartbeat_jog(self, session_id: str) -> None:
+        session_id = self._validate_jog_id(session_id)
+        with self.command_lock:
+            if self.jog_session_id != session_id or self.jog_motion is None:
+                raise JogConflictError("Jog session is no longer active")
+            if not self.hardware.renew_motion(self.jog_motion, JOG_LEASE_SEC):
+                self._invalidate_jog()
+                self.hardware.stop_pwm()
+                raise JogConflictError("Jog session expired; release and press again")
+
+    def stop_jog(self, session_id: str) -> None:
+        session_id = self._validate_jog_id(session_id)
+        with self.command_lock:
+            # Even an early release invalidates pending Starts, but releasing an
+            # old hold must not stop another browser's already-active hold.
+            with self.state_lock:
+                self.jog_generation += 1
+            if self.jog_session_id == session_id:
+                self._invalidate_jog()
+                self.hardware.stop_pwm()
 
     def home(self) -> None:
-        if self.is_switch_override_active():
-            return
-        with self.hardware.lock:
-            if self.hardware.is_moving:
+        with self.command_lock:
+            if self.is_switch_override_active() or self.shutdown_event.is_set():
                 return
-        self.cancel_countdown()
-        with self.state_lock:
-            self.active_target = None
-            self.cycle_pause_phase = None
-            self.cycle_pause_deadline = None
-            self.cycle_pending_sequence_id = None
-            self.cycle_pending_direction = None
-            self.last_cycle_end_reason = None
-            self.last_runtime_error = None
-        threading.Thread(target=self._home_worker, daemon=True).start()
+            with self.hardware.lock:
+                if self.hardware.is_moving:
+                    return
+            self.stop_cycle("homing")
+            self.cancel_countdown()
+            with self.state_lock:
+                self.last_cycle_end_reason = None
+                self.last_runtime_error = None
+            session = self._reserve_motion()
+            if session is not None:
+                self._launch_motion_worker(self._home_worker, (), session)
 
     def stop_all(self) -> None:
-        self.stop_cycle("stopped")
-        self.cancel_countdown()
-        with self.state_lock:
-            self.active_target = None
-            self.movement_token += 1
-            self.is_cycle_paused = False
-            self.cycle_pause_phase = None
-            self.cycle_pause_deadline = None
-            self.cycle_pending_sequence_id = None
-            self.cycle_pending_direction = None
-            self.last_runtime_error = None
-        with self.hardware.lock:
-            self.hardware.is_paused = False
-        self.hardware.stop_pwm()
-        self.hardware.enable(False)
+        with self.command_lock:
+            # Cancel countdowns before any GPIO error can interrupt cleanup.
+            self.cancel_countdown()
+            with self.state_lock:
+                self.active_target = None
+                self.movement_token += 1
+                self.last_runtime_error = None
+            self.hardware.resume()
+            self.stop_cycle("stopped")
 
     def read_toggle_switch_direction(self) -> int:
         req = self.hardware.req
@@ -2274,17 +2399,21 @@ class InstallationController:
         return 0
 
     def apply_switch_direction(self, direction: int) -> None:
-        if direction == 0:
-            self.hardware.stop_pwm()
-            return
-        self.cancel_countdown()
-        self.stop_cycle("switch override")
-        with self.state_lock:
-            self.active_target = None
-            self.last_runtime_error = None
-        self.hardware.stop_pwm()
-        self.hardware.resume()
-        threading.Thread(target=self._manual_move_worker, args=(direction, self.speed_duty, "switch"), daemon=True).start()
+        with self.command_lock:
+            if self.shutdown_event.is_set():
+                return
+            if direction == 0:
+                self._invalidate_jog()
+                self.hardware.stop_pwm()
+                return
+            self.cancel_countdown()
+            self.stop_cycle("switch override")
+            with self.state_lock:
+                self.active_target = None
+                self.last_runtime_error = None
+            session = self._reserve_motion()
+            if session is not None:
+                self._launch_motion_worker(self._manual_move_worker, (direction, self.speed_duty, "switch"), session)
 
     def is_switch_override_active(self) -> bool:
         with self.state_lock:
@@ -2293,33 +2422,45 @@ class InstallationController:
     def _poll_toggle_switch_loop(self) -> None:
         interval = SW_POLL_MS / 1000.0
         while not self.shutdown_event.is_set():
-            direction_now = self.read_toggle_switch_direction()
-
-            with self.state_lock:
-                if direction_now == self.switch_raw_dir:
-                    self.switch_same_count += 1
-                else:
-                    self.switch_raw_dir = direction_now
-                    self.switch_same_count = 1
-
-                should_apply = (
-                    self.switch_same_count >= SW_DEBOUNCE_SAMPLES
-                    and direction_now != self.switch_stable_dir
-                )
+            # Commit and apply the sampled switch change as one command so a
+            # sample queued before Stop cannot reserve a motion after it.
+            with self.command_lock:
+                if self.shutdown_event.is_set():
+                    break
+                direction_now = self.read_toggle_switch_direction()
+                with self.state_lock:
+                    if direction_now == self.switch_raw_dir:
+                        self.switch_same_count += 1
+                    else:
+                        self.switch_raw_dir = direction_now
+                        self.switch_same_count = 1
+                    should_apply = (
+                        self.switch_same_count >= SW_DEBOUNCE_SAMPLES
+                        and direction_now != self.switch_stable_dir
+                    )
+                    if should_apply:
+                        self.switch_stable_dir = direction_now
                 if should_apply:
-                    self.switch_stable_dir = direction_now
+                    try:
+                        self.apply_switch_direction(direction_now)
+                    except Exception as exc:
+                        self._set_runtime_error(str(exc))
+                        self.hardware.stop_pwm(ignore_errors=True)
 
-            if should_apply:
-                self.apply_switch_direction(direction_now)
-
-            time.sleep(interval)
+            self.shutdown_event.wait(interval)
 
     def shutdown(self) -> None:
         self.shutdown_event.set()
-        self.stop_all()
-        self.stop_mpv_display()
-        self._cancel_scheduled_settings_save()
-        self._save_settings()
+        # Latch out new hardware reservations before waiting for commands,
+        # display IPC or persistence. Queued HTTP/worker threads cannot rearm.
+        self.hardware.close()
+        try:
+            self.stop_all()
+        finally:
+            self.switch_thread.join(timeout=1.0)
+            self.stop_mpv_display()
+            self._cancel_scheduled_settings_save()
+            self._save_settings()
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -2373,8 +2514,12 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             self._serve_file(WEB_DIR / "sw.js", cache_control="no-cache", head_only=head_only)
             return
         if path.startswith("/icons/"):
-            relative_path = unquote(path[len("/icons/"):])
-            self._serve_file(BASE_DIR / "icons" / relative_path, cache_control="public, max-age=86400", head_only=head_only)
+            relative_path = unquote(path[len("/icons/"):]).replace("\\", "/")
+            file_path = self._safe_join(BASE_DIR / "icons", relative_path)
+            if not file_path or not file_path.is_file():
+                self._json_error(HTTPStatus.NOT_FOUND, "Icon not found")
+                return
+            self._serve_file(file_path, cache_control="public, max-age=86400", head_only=head_only)
             return
         if path == "/api/state":
             self._send_json(self._controller_state(), head_only=head_only)
@@ -2475,9 +2620,16 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             elif action == "qr_sync_toggle":
                 controller.toggle_qr_sync_display()
             elif action == "jog_start":
-                controller.start_jog(int(payload.get("direction", 0)))
+                controller.start_jog(
+                    int(payload.get("direction", 0)), payload.get("session_id"), payload.get("generation"), payload.get("epoch")
+                )
+            elif action == "jog_heartbeat":
+                controller.heartbeat_jog(payload.get("session_id"))
+                # Renewal should not wait for camera detection or media state.
+                self._send_json({"ok": True})
+                return
             elif action == "jog_stop":
-                controller.stop_jog()
+                controller.stop_jog(payload.get("session_id"))
             elif action == "refresh_library":
                 controller.refresh_library()
             elif action == "next_sequence":
@@ -2487,6 +2639,12 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json_error(HTTPStatus.BAD_REQUEST, "Unknown action")
                 return
+        except JogConflictError as exc:
+            self._json_error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except (TypeError, ValueError) as exc:
+            self._json_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         except Exception as exc:
             self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Action failed: {exc}")
             return
@@ -2787,10 +2945,14 @@ class MpvDisplayBackend:
 
         try:
             self._terminate_existing_mpv_processes()
+        except Exception:
+            pass
+        try:
             if MPV_IPC_PATH.exists():
                 MPV_IPC_PATH.unlink()
         except Exception:
             pass
+        self._clear_playlist_cache()
 
         command = [
             mpv_path,
@@ -2872,6 +3034,13 @@ class MpvDisplayBackend:
             MPV_PID_FILE.unlink()
         except Exception:
             pass
+
+    def _clear_playlist_cache(self) -> None:
+        for path in self.playlist_dir.glob("*.txt"):
+            try:
+                path.unlink()
+            except Exception:
+                pass
 
     def _process_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -3122,6 +3291,7 @@ class MpvDisplayBackend:
             indexes.append(last_index)
         if direction < 0:
             indexes.reverse()
+        ordered_paths = [sequence.frame_paths[index] for index in indexes]
 
         frame_count = max(1, len(indexes))
         fps = max(0.1, frame_count / max(0.01, duration_sec))
@@ -3129,18 +3299,33 @@ class MpvDisplayBackend:
             fps = min(fps, self.fps_cap)
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.id)[:80] or "sequence"
         content_signature = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence.content_signature or "nosig")[:24]
-        playlist_path = self.playlist_dir / f"{safe_id}_{content_signature}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
+        order_digest = hashlib.sha1()
+        for relative_path in ordered_paths:
+            order_digest.update(relative_path.encode("utf-8", "surrogateescape"))
+            order_digest.update(b"\0")
+        order_signature = order_digest.hexdigest()[:12]
+        playlist_path = self.playlist_dir / (
+            f"v{MPV_IMAGE_PLAYLIST_CACHE_VERSION}_{safe_id}_{content_signature}_"
+            f"{order_signature}_{'up' if direction >= 0 else 'down'}_s{stride}.txt"
+        )
 
         if not playlist_path.exists():
             playlist_path.parent.mkdir(parents=True, exist_ok=True)
-            lines = []
-            for index in indexes:
-                relative_path = sequence.frame_paths[index]
-                lines.append(str((MEDIA_ROOT / relative_path).resolve()))
+            lines = [str((MEDIA_ROOT / relative_path).resolve()) for relative_path in ordered_paths]
             playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         return {
-            "key": ("images", sequence.id, sequence.content_signature, direction, stride, sequence.frame_count, round(fps, 3)),
+            "key": (
+                "images",
+                MPV_IMAGE_PLAYLIST_CACHE_VERSION,
+                sequence.id,
+                sequence.content_signature,
+                order_signature,
+                direction,
+                stride,
+                sequence.frame_count,
+                round(fps, 3),
+            ),
             "source": f"mf://@{playlist_path}",
             "options": {"mf-fps": f"{fps:.6f}"},
             "duration_sec": duration_sec,
@@ -3384,45 +3569,99 @@ def print_launch_hints(host: str, port: int) -> None:
     print()
 
 
+def _disable_and_release_gpio(req: Any) -> None:
+    if req is None:
+        return
+    # Also cover failures partway through controller construction or shutdown.
+    # Attempt every output even if one write fails.
+    if gpiod is not None:
+        for line in (REN, LEN, RPWM, LPWM):
+            try:
+                req.set_value(line, gpiod.line.Value.INACTIVE)
+            except Exception as exc:
+                print(f"Warning: could not deactivate GPIO {line}: {exc}")
+    try:
+        req.release()
+    except Exception as exc:
+        print(f"Warning: could not release GPIO: {exc}")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
     WEB_DIR.mkdir(parents=True, exist_ok=True)
 
-    req = request_gpio_lines(require_gpio=args.require_gpio)
-    controller = InstallationController(req, mpv_bin=args.mpv_bin, mpv_fps_cap=args.mpv_fps_cap)
-    ActuatorRequestHandler.controller = controller
-    ActuatorRequestHandler.pi_camera = (
-        PiCameraRuntime(BASE_DIR / "experiments" / "pi_long_exposure" / "captures")
-        if PiCameraRuntime is not None
-        else None
-    )
-    if args.display_backend == "mpv":
-        if not controller.start_mpv_display():
-            controller.set_display_backend_status("browser", "MPV display unavailable; use /display")
-    elif args.display_backend == "none":
-        controller.set_display_backend_status("none", "No fullscreen display backend")
+    req = None
+    controller = None
+    server = None
+    shutdown_requested = False
+    previous_handlers: dict[int, Any] = {}
 
-    if AUTO_START_CYCLE_ON_BOOT:
-        controller.start_cycle_countdown(AUTO_START_CYCLE_DELAY_SEC, remember_delay=True)
-        print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
+    def request_shutdown(signum: int, frame: Any) -> None:
+        nonlocal shutdown_requested
+        # A signal can interrupt code while it owns a lock. Defer all cleanup
+        # and controller operations until normal execution resumes.
+        shutdown_requested = True
 
-    server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
-
-    print_launch_hints(args.host, args.port)
     try:
-        server.serve_forever()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, request_shutdown)
+
+        # Fail an occupied-port startup before acquiring GPIO, starting switch
+        # polling, or replacing the running installation's display process.
+        server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
+        server.timeout = 0.2
+        if shutdown_requested:
+            return
+
+        req = request_gpio_lines(require_gpio=args.require_gpio)
+        if shutdown_requested:
+            return
+        controller = InstallationController(req, mpv_bin=args.mpv_bin, mpv_fps_cap=args.mpv_fps_cap)
+        ActuatorRequestHandler.controller = controller
+        if shutdown_requested:
+            return
+        ActuatorRequestHandler.pi_camera = (
+            PiCameraRuntime(BASE_DIR / "experiments" / "pi_long_exposure" / "captures")
+            if PiCameraRuntime is not None
+            else None
+        )
+        if shutdown_requested:
+            return
+        if args.display_backend == "mpv":
+            if not controller.start_mpv_display():
+                controller.set_display_backend_status("browser", "MPV display unavailable; use /display")
+        elif args.display_backend == "none":
+            controller.set_display_backend_status("none", "No fullscreen display backend")
+
+        if AUTO_START_CYCLE_ON_BOOT and not shutdown_requested:
+            controller.start_cycle_countdown(AUTO_START_CYCLE_DELAY_SEC, remember_delay=True)
+            print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
+
+        print_launch_hints(args.host, args.port)
+        # handle_request() respects timeout, so the main thread can observe a
+        # signal without locking inside its handler or calling shutdown() from
+        # the same thread as serve_forever(). Requests still run in threads.
+        while not shutdown_requested:
+            server.handle_request()
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        server.shutdown()
-        server.server_close()
-        controller.shutdown()
-        if req:
+        try:
+            if controller is not None:
+                controller.shutdown()
+        except Exception as exc:
+            print(f"Warning: controller shutdown failed: {exc}")
+        finally:
+            _disable_and_release_gpio(req)
+            ActuatorRequestHandler.controller = None
+            ActuatorRequestHandler.pi_camera = None
             try:
-                req.release()
-            except Exception:
-                pass
+                if server is not None:
+                    server.server_close()
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 if __name__ == "__main__":
