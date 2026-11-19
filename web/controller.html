@@ -452,6 +452,7 @@
 
         .preview-meta { margin-top: 10px; color: var(--muted); }
         .field { display: grid; gap: 8px; }
+        #poweroffTools[hidden], #poweroffForm[hidden] { display: none; }
         .field label,
         .field-label { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
         .range-label {
@@ -474,7 +475,7 @@
             height: 18px;
             accent-color: var(--accent);
         }
-        input[type="number"], input[type="text"], input[type="search"], select {
+        input[type="number"], input[type="text"], input[type="search"], input[type="password"], select {
             width: 100%;
             min-height: 50px;
             border: 1px solid var(--line);
@@ -1185,7 +1186,7 @@
             <div class="rail-header">
                 <div class="rail-stat">
                     <span class="rail-label">Now</span>
-                    <div class="rail-value" id="positionValue">0.0%</div>
+                    <div class="rail-value" id="positionValue">Unknown</div>
                 </div>
                 <div class="rail-stat">
                     <span class="rail-label">Target</span>
@@ -1198,6 +1199,11 @@
                     <span id="cycleFlag" class="hero-flag cycle" hidden>Cycle</span>
                 </div>
                 <span id="runStatusText" class="rail-run-text">Ready</span>
+            </div>
+            <div id="positionRecovery" class="hint" hidden role="status">
+                <p id="positionRecoveryReason">Position unknown. Home the lift before starting automatic playback.</p>
+                <button id="recoverHomeBtn" type="button" class="ok">Home lift</button>
+                <button type="button" class="secondary" data-mark-home disabled>Mark as home</button>
             </div>
             <div class="slider-row">
                 <div class="target-slider-wrap">
@@ -1340,11 +1346,12 @@
             </div>
             <div class="cycle-toolbar">
                 <div class="field">
-                    <span class="field-label">QR Display</span>
-                    <label class="checkbox-field" for="qrSyncEnabledInput">
-                        <input id="qrSyncEnabledInput" type="checkbox" checked>
-                        <span>Show QR when idle</span>
-                    </label>
+                    <label for="idleDisplaySelect">Idle display</label>
+                    <select id="idleDisplaySelect">
+                        <option value="qr">QR code</option>
+                        <option value="black">Black screen</option>
+                        <option value="frame">Current frame</option>
+                    </select>
                 </div>
                 <div class="field">
                     <label for="shuffleCycleOrderBtn">Order</label>
@@ -1487,6 +1494,14 @@
                         <div class="hint" id="speedValue">100%</div>
                     </div>
                     <div class="field">
+                        <label for="bottomDeadbandInput">Bottom playback delay</label>
+                        <div class="unit-input">
+                            <input id="bottomDeadbandInput" type="number" min="0" max="5" step="0.05" value="0" inputmode="decimal">
+                            <span class="field-unit" aria-hidden="true">s</span>
+                        </div>
+                        <div class="hint">Black screen while rising from the bottom. Set at 100% speed; scales with speed. Applies on the next rise from the bottom.</div>
+                    </div>
+                    <div class="field">
                         <label class="range-label" for="qrSyncGuardRange">
                             <span>QR Blackout</span>
                             <span id="qrSyncGuardValue" class="range-value">5s</span>
@@ -1531,6 +1546,16 @@
                     <div class="advanced-actions" style="margin-top: 10px;">
                         <button id="reloadControllerBtn" type="button" class="secondary">Reload Controller</button>
                         <button id="homeBtn" type="button" class="ok">Force Home</button>
+                        <button type="button" class="secondary" data-mark-home disabled>Mark as home</button>
+                    </div>
+                    <div id="poweroffTools" class="field" hidden>
+                        <form id="poweroffForm" class="field" hidden>
+                            <label for="poweroffToken">Shutdown key</label>
+                            <input id="poweroffToken" type="password" required autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="43">
+                            <button id="poweroffBtn" type="submit" class="secondary">Shut down Pi</button>
+                        </form>
+                        <p id="poweroffHttpsHint" class="hint" hidden>Open the controller over HTTPS to shut down the Pi.</p>
+                        <p id="poweroffStatus" class="hint" role="status"></p>
                     </div>
                 </section>
 
@@ -1575,9 +1600,10 @@
         const cycleFlag = $("#cycleFlag");
         const targetRange = $("#targetRange");
         const delayInput = $("#delayInput");
+        const bottomDeadbandInput = $("#bottomDeadbandInput");
         const speedRange = $("#speedRange");
         const speedValue = $("#speedValue");
-        const qrSyncEnabledInput = $("#qrSyncEnabledInput");
+        const idleDisplaySelect = $("#idleDisplaySelect");
         const qrSyncDebugInput = $("#qrSyncDebugInput");
         const qrSyncUpcomingRange = $("#qrSyncUpcomingRange");
         const qrSyncUpcomingValue = $("#qrSyncUpcomingValue");
@@ -1706,6 +1732,7 @@
 
         function playbackDirectionForState(state) {
             if (!state) return 1;
+            if (state.motion_direction === 1 || state.motion_direction === -1) return state.motion_direction;
             if (state.switch_direction !== 0) return state.switch_direction > 0 ? 1 : -1;
             const positionPct = Number(state.position_pct || 0);
             const activeTarget = Number(state.active_target_pct);
@@ -1727,7 +1754,7 @@
             const { strokeCm, heightCm } = sequenceSpan(sequence);
             const travelDirection = direction < 0 ? -1 : 1;
             const strokeSec = travelDirection > 0
-                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC)
+                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC) - Number(state?.playback_deadband_sec || 0)
                 : Number(state?.retract_sec || DEFAULT_RETRACT_SEC);
             const duty = clamp(Number(state?.speed_duty || 1), 0.1, 1);
             const durationSec = ((heightCm / strokeCm) * Math.max(0.01, strokeSec)) / duty;
@@ -2394,8 +2421,9 @@
             const startCm = clamp(Number(sequence.start_cm || 0), 0, strokeCm - MIN_SEQUENCE_HEIGHT_CM);
             const heightCm = Number(sequence.volume_height_cm || strokeCm);
             const endCm = Number(sequence.end_cm || (startCm + heightCm));
-            const positionCm = (clamp(Number(state.position_pct || 0), 0, 100) / 100) * strokeCm;
-            const ratio = playbackRatioForPosition(sequence, state.position_pct);
+            const positionPct = state.playback_position_pct ?? state.position_pct;
+            const positionCm = (clamp(Number(positionPct || 0), 0, 100) / 100) * strokeCm;
+            const ratio = playbackRatioForPosition(sequence, positionPct);
             const frameLimit = frameRateLimitForSequence(sequence, playbackDirectionForState(state), state);
             const requestedFps = Math.round(frameLimit.requestedFps);
             const effectiveFps = frameLimit.effectiveFps >= 10
@@ -2405,7 +2433,7 @@
             sequenceHeightValue.textContent = formatCm(heightCm);
             sequenceSpanValue.textContent = `${formatCm(startCm)}-${formatCm(endCm)}`;
             sequenceLiftValue.textContent = formatCm(positionCm);
-            sequencePlaybackValue.textContent = ratio == null ? "Outside" : `${Math.round(ratio * 100)}%`;
+            sequencePlaybackValue.textContent = state.playback_deadband_active ? "Bottom delay" : (ratio == null ? "Outside" : `${Math.round(ratio * 100)}%`);
             sequenceRateValue.textContent = frameLimit.stride > 1
                 ? `${requestedFps} -> ${effectiveFps} fps`
                 : `${requestedFps} fps`;
@@ -2458,9 +2486,10 @@
             const targetFixed = displayTargetForState(state).toFixed(1);
             syncFieldValue(targetRange, targetFixed);
             syncFieldValue(delayInput, state.delay_sec);
+            syncFieldValue(bottomDeadbandInput, state.bottom_deadband_sec ?? 0);
             syncFieldValue(speedRange, state.speed_duty);
             if (!isFieldActive(speedRange)) updateSpeedLabel(state.speed_duty);
-            qrSyncEnabledInput.checked = state.qr_sync_enabled !== false;
+            syncFieldValue(idleDisplaySelect, state.idle_display_mode ?? (state.qr_sync_enabled === false ? "black" : "qr"));
             qrSyncDebugInput.checked = state.qr_sync_debug_enabled === true;
             syncFieldValue(qrSyncUpcomingRange, state.qr_sync_upcoming_count ?? 2);
             syncFieldValue(qrSyncNameCountRange, state.qr_sync_name_count ?? 1);
@@ -2556,6 +2585,9 @@
 
         function getRunStatus(state) {
             const cyclePause = getEffectiveCyclePauseState(state);
+            if (state.position_known === false) {
+                return { text: state.is_moving ? "Manual movement · position unknown" : "Position unknown — Home required", tone: "warn" };
+            }
             if (state.switch_direction !== 0) {
                 return {
                     text: state.switch_direction > 0 ? "Manual extend" : "Manual retract",
@@ -2633,7 +2665,25 @@
         function renderStatus(state) {
             const cyclePause = getEffectiveCyclePauseState(state);
             const displayTarget = displayTargetForState(state);
-            positionValue.textContent = `${state.position_pct.toFixed(1)}%`;
+            const poweroffAvailable = state.poweroff_available === true && window.location.protocol === "https:";
+            $("#poweroffTools").hidden = state.poweroff_configured !== true;
+            $("#poweroffForm").hidden = !poweroffAvailable;
+            $("#poweroffHttpsHint").hidden = poweroffAvailable;
+            const positionKnown = state.position_known !== false;
+            positionValue.textContent = positionKnown ? `${state.position_pct.toFixed(1)}%` : "Unknown";
+            const positionReferenceLabels = {
+                restored: "Restored position estimate",
+                manual_home: "Position referenced from a manually confirmed home"
+            };
+            positionValue.title = positionKnown
+                ? (positionReferenceLabels[state.position_reference] || "Position estimated from motor running time")
+                : (state.position_error || "Home required");
+            $("#positionRecovery").hidden = positionKnown;
+            $("#positionRecoveryReason").textContent = state.position_error || "Home the lift before starting automatic playback.";
+            $("#recoverHomeBtn").disabled = state.is_moving || state.switch_direction !== 0;
+            for (const button of document.querySelectorAll("[data-mark-home]")) {
+                button.disabled = state.is_moving || state.is_cycling || state.countdown_deadline_ms != null || state.switch_direction !== 0;
+            }
             targetValue.textContent = `${displayTarget.toFixed(1)}%`;
             switchValue.textContent = state.switch_label;
             libraryValue.textContent = `${libraryItems.length}`;
@@ -2667,6 +2717,8 @@
                 }
             }
             updateTargetVisualization(state.position_pct);
+            $("#currentMarker").style.visibility = positionKnown ? "visible" : "hidden";
+            $("#currentProgress").style.visibility = positionKnown ? "visible" : "hidden";
             const runState = getRunStatus(state);
             runStatus.dataset.tone = runState.tone;
             runStatusText.textContent = runState.text;
@@ -2683,6 +2735,8 @@
             cycleBtn.textContent = state.is_cycling
                 ? "Stop Cycle"
                 : (state.countdown_deadline_ms && state.countdown_action === "cycle" ? "Cancel Delay" : "Start Cycle");
+            playBtn.disabled = !positionKnown && !state.is_moving && !state.countdown_deadline_ms;
+            cycleBtn.disabled = !positionKnown && !state.is_cycling && !state.countdown_deadline_ms;
         }
 
         function populateLibrary(selectedId) {
@@ -2791,11 +2845,25 @@
             }
 
             const sequenceName = currentState.selected_sequence_display_name || sequenceDisplayName(currentSequence) || "Sequence";
+            if (currentState.position_known === false) {
+                previewVideo.pause();
+                previewEmpty.textContent = "Position unknown — Home required";
+                setPreviewMode("empty");
+                return;
+            }
+            if (currentState.playback_deadband_active) {
+                previewVideo.pause();
+                previewEmpty.textContent = "Bottom playback delay";
+                previewMeta.textContent = `${sequenceName} | Waiting for the lift to rise`;
+                setPreviewMode("empty");
+                return;
+            }
+            const playbackPosition = currentState.playback_position_pct ?? currentState.position_pct;
 
             if (currentSequence.kind === "images") {
                 const frame = frameIndexForSequencePosition(
                     currentSequence,
-                    currentState.position_pct,
+                    playbackPosition,
                     playbackDirectionForState(currentState)
                 );
                 if (frame == null) {
@@ -2822,7 +2890,7 @@
                 previewVideo.src = currentSequence.media_url;
                 previewVideo.load();
             }
-            const videoRatio = playbackRatioForPosition(currentSequence, currentState.position_pct);
+            const videoRatio = playbackRatioForPosition(currentSequence, playbackPosition);
             if (videoRatio == null) {
                 previewMeta.textContent = `${sequenceName} | ${formatSequenceSpan(currentSequence)}`;
                 if (currentSequence.preview_url) {
@@ -3087,9 +3155,9 @@
             speedDebounce = setTimeout(() => pushSettings({ speed_duty: Number(speedRange.value) }).catch(() => {}), 120);
         });
 
-        qrSyncEnabledInput.addEventListener("change", () => {
+        idleDisplaySelect.addEventListener("change", () => {
             holdFormSync();
-            pushSettings({ qr_sync_enabled: qrSyncEnabledInput.checked }).catch(() => {});
+            pushSettings({ idle_display_mode: idleDisplaySelect.value }).catch(() => {});
         });
 
         qrSyncDebugInput.addEventListener("change", () => {
@@ -3134,6 +3202,14 @@
         });
 
         delayInput.addEventListener("input", () => { holdFormSync(2500); });
+        bottomDeadbandInput.addEventListener("input", () => { holdFormSync(2500); });
+        bottomDeadbandInput.addEventListener("change", () => {
+            holdFormSync();
+            const fallback = currentState?.bottom_deadband_sec ?? 0;
+            const value = Number(clamp(parseNumericInput(bottomDeadbandInput, fallback), 0, 5).toFixed(3));
+            bottomDeadbandInput.value = String(value);
+            pushSettings({ bottom_deadband_sec: value }).catch(() => {});
+        });
         pauseExtendInput.addEventListener("input", () => { holdFormSync(2500); });
         pauseRetractInput.addEventListener("input", () => { holdFormSync(2500); });
 
@@ -3299,7 +3375,41 @@
         playBtn.addEventListener("click", async () => { await postAction("play_pause"); });
         cycleBtn.addEventListener("click", async () => { await postAction("cycle_toggle"); });
         $("#homeBtn").addEventListener("click", async () => { if (window.confirm("Retract fully to zero the lift?")) await postAction("home"); });
+        $("#recoverHomeBtn").addEventListener("click", async () => { if (window.confirm("Retract fully to establish the lift's position?")) await postAction("home"); });
+        for (const button of document.querySelectorAll("[data-mark-home]")) {
+            button.addEventListener("click", async () => {
+                if (!window.confirm("Is the lift fully lowered? Confirm to save this position as 0%.")) return;
+                try {
+                    await postAction("mark_home", { confirmed_at_bottom: true });
+                } catch (error) {
+                    window.alert(error.message || "Could not mark the lift as home.");
+                }
+            });
+        }
         $("#stopBtn").addEventListener("click", async () => { await postAction("stop"); });
+        $("#poweroffForm").addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const button = $("#poweroffBtn");
+            if (button.disabled) return;
+            if (currentState?.poweroff_available !== true || window.location.protocol !== "https:") return;
+            if (!window.confirm("Stop the lift and shut down the Raspberry Pi?")) return;
+
+            const field = $("#poweroffToken");
+            const status = $("#poweroffStatus");
+            button.disabled = true;
+            status.textContent = "Requesting shutdown…";
+            try {
+                await apiPost("/api/poweroff", { token: field.value.trim(), confirmed: true });
+                status.textContent = "Shutdown requested. Wait for the Pi to finish before cutting power.";
+            } catch (error) {
+                status.textContent = error instanceof TypeError
+                    ? "Connection lost before confirmation. Check the Pi before cutting power."
+                    : (error.message || "Could not confirm shutdown.");
+                button.disabled = false;
+            } finally {
+                field.value = "";
+            }
+        });
         for (const control of [
             piCameraResolutionSelect,
             piCameraDurationRange,

@@ -2,6 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${1:-}" in
+    --quit|--poweroff)
+        action="${1#--}"
+        shift
+        exec python3 "$SCRIPT_DIR/shutdown_time_volume.py" "$action" "$@"
+        ;;
+esac
+
 RUN_DIR="$SCRIPT_DIR/.run"
 PID_FILE="$RUN_DIR/time_volume_server.pid"
 BROWSER_PID_FILE="$RUN_DIR/time_volume_browser.pid"

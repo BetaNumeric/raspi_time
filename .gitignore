@@ -7,6 +7,11 @@ volumetric_time_camera/
 *.log
 *.tmp
 actuator_state.json
+.shutdown-token
+actuator_state.json.bak
+actuator_position*.json
+actuator_position*.json.bak
+actuator_position*.moving
 
 .DS_Store
 Thumbs.db

@@ -23,6 +23,9 @@ class ControllerSafetyTests(unittest.TestCase):
             replacement.start()
             self.addCleanup(replacement.stop)
         self.controller = app.InstallationController(None)
+        # These command regressions start from an already referenced lift.
+        self.controller.hardware.position_known = True
+        self.controller.hardware.position_error = None
         self.addCleanup(self.controller.shutdown)
         self.queued = []
 

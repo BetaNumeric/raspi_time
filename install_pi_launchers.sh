@@ -52,11 +52,24 @@ Terminal=false
 Categories=AudioVideo;Graphics;
 EOF
 
+cat > "$DESKTOP_DIR/Quit Time Volume.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Quit Time Volume
+Comment=Stop the lift and close the controller
+Path=$SCRIPT_DIR
+Exec="$SCRIPT_DIR/stop_time_volume.sh" --quit --desktop
+Terminal=true
+Categories=AudioVideo;
+EOF
+
 rm -f "$DESKTOP_DIR/Start Time Volume Display.desktop"
 
 chmod +x \
     "$DESKTOP_DIR/Start Time Volume.desktop" \
-    "$DESKTOP_DIR/Stop Time Volume.desktop"
+    "$DESKTOP_DIR/Stop Time Volume.desktop" \
+    "$DESKTOP_DIR/Quit Time Volume.desktop"
 
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
     cat > "$AUTOSTART_DIR/Start Time Volume.desktop" <<EOF
@@ -77,6 +90,7 @@ fi
 echo "Desktop launchers created on $DESKTOP_DIR"
 echo "  Start Time Volume.desktop"
 echo "  Stop Time Volume.desktop"
+echo "  Quit Time Volume.desktop"
 if [[ "$ENABLE_AUTOSTART" == "1" ]]; then
     echo "Autostart enabled."
     echo "Autostart log: $SCRIPT_DIR/.run/time_volume_launcher.log"

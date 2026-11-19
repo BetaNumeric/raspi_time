@@ -129,6 +129,68 @@ fullscreen MPV display while leaving the boot-managed controller server alive.
 That keeps the physical switch/control path available and makes the next Start
 quick.
 
+For a full stop, use **Quit Time Volume** on the Pi desktop. Run
+`./install_pi_launchers.sh` to add the shortcut. You can also quit or shut the Pi
+down from a terminal:
+
+```bash
+./stop_time_volume.sh --quit
+./stop_time_volume.sh --poweroff
+```
+
+Both actions wait for the controller to exit through its normal shutdown path,
+which stops the lift and saves its estimated position. The Pi's permissions
+apply when stopping the boot service or shutting down. If the OS asks for
+authentication, use an authorized local account. If you started the Python
+server directly in a terminal, use Ctrl+C there and wait for it to exit.
+Wait for the Pi itself to finish shutting down before unplugging it.
+
+### Shut down from the controller
+
+Once configured, **Advanced → Tools → Shut down Pi** stops motion, checkpoints
+the lift position and requests an orderly OS shutdown. Remote poweroff is off
+by default. Set it up once on the Pi:
+
+1. As the account that runs the controller, create a private shutdown key in
+   the checkout and copy the printed key to your password manager.
+
+   ```bash
+   (umask 077; set -o noclobber; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > .shutdown-token) &&
+       cat .shutdown-token
+   ```
+
+2. Use `sudo visudo -f /etc/sudoers.d/time-volume-poweroff` to give that account
+   permission for the exact command below. Replace `YOUR_USER` with the account
+   running Time Volume, which is the boot service's `User=` if you use one.
+
+   ```sudoers
+   YOUR_USER ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
+   ```
+
+3. Open the controller through a trusted HTTPS reverse proxy running on the Pi.
+   It must forward to `127.0.0.1:8000` (or your configured port) and overwrite
+   `X-Forwarded-Proto` with the actual client scheme. A
+   [Caddy reverse proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)
+   does this by default. Use a hostname and certificate your phone trusts.
+   Keep the controller on your private network or VPN.
+
+   For example, a Caddyfile site block for a Pi reachable as `raspberrypi.local`
+   can use the following configuration. Trust Caddy's
+   [local root certificate](https://caddyserver.com/docs/automatic-https#local-https)
+   on the phone before entering the shutdown key.
+
+   ```caddyfile
+   raspberrypi.local {
+       tls internal
+       reverse_proxy 127.0.0.1:8000
+   }
+   ```
+
+Restart Time Volume so it reads the key, open the HTTPS controller, enter the
+key under **Advanced → Tools**, and confirm **Shut down Pi**. Wait for the Pi to
+finish shutting down before removing power. To disable this feature, remove
+`.shutdown-token` and the sudoers entry, then restart Time Volume.
+
 The default display backend is a dedicated fullscreen MPV process. To run the
 monitor through the browser fallback at `/display` instead:
 
@@ -149,6 +211,16 @@ start, the launcher falls back to the web display at `/display`.
 
 ## Motion Control Safeguards
 
+In **Advanced → Bottom playback delay**, set the time the motor runs before the
+display starts rising from the bottom (0–5 seconds, default 0). Measure it at
+100% speed; a setting of 0.5 seconds becomes 1 second at 50% speed. The monitor
+stays black during that interval, then plays the entire sequence over the
+remaining upstroke. The calibrated motor run time and QR capture window stay
+the same. This applies to images and videos in MPV and the browser display.
+The setting is saved and takes effect on the next rise from the bottom; pauses
+and resumes retain the current upstroke's compensation. Midstroke starts and
+descents use their existing timing.
+
 Stop cancels both active motion and workers that have not started yet. Movement,
 homing, and GPIO cleanup validate their motion session before changing outputs,
 so cancelled workers cannot restart the lift or interfere with a newer movement.
@@ -162,8 +234,31 @@ clients using Jog must send the current `jog_epoch`, `jog_generation`, and a uni
 hold identifier as `epoch`, `generation`, and `session_id` with `jog_start`, renew
 with `jog_heartbeat`, and release with `jog_stop` using the same `session_id`.
 
-Position is still estimated from running time; this change does not add position
-feedback or verify that timed homing physically reached the bottom.
+Position is estimated from running time. A stopped estimate is saved locally in
+`actuator_position.json` and restored when the server restarts. A previous valid
+copy is retained as `actuator_position.json.bak`. Both position and settings saves
+flush file contents, replace files atomically, and sync the containing directory;
+settings also retain `actuator_state.json.bak` for recovery from damaged JSON.
+
+Before enabling the motor, the server durably writes `actuator_position.moving`.
+That marker is removed only after the motor outputs are disabled and the stopped
+checkpoint is durable. An interrupted movement, a missing checkpoint, or a damaged
+or checksum-invalid position file means **Position unknown — Home required**.
+The controller blocks automatic movement and countdowns until you establish a
+home reference. **Home lift** retracts the lift. If the lift is already fully
+lowered, choose **Mark as home** in the recovery panel or under **Advanced →
+Tools** to save 0% without moving it. Stop any movement, cycle, or countdown and
+set the physical switch to off before confirming. Jog and physical-switch
+control remain available, and the monitor stays black while the position is
+unknown. An older backup is never
+silently trusted as the current height. Simulation uses separate position files.
+
+After upgrading from a version that did not save position, establish a home
+reference on the first startup. Start automatic playback explicitly if startup
+cycling was skipped. A cancelled Home does not establish a reference. Homing is still
+timed retraction, not sensor confirmation, and a saved estimate assumes the lift
+was not moved while the Pi was off. These measures reduce write-loss risk but
+cannot guarantee an SD card or filesystem will survive every abrupt power cut.
 
 Run the hardware-free regressions with:
 
@@ -198,10 +293,12 @@ auto-start/stop the stack capture when the next lift movement begins. Set
 **QR Action** to **Info only** if you want the camera app to show the decoded
 sequence/timing without starting a capture. The camera app uses the browser QR
 detector when available and falls back to a JavaScript decoder for iPhones. The
-controller's Advanced settings include **Show QR**, **QR Info Text**, and one
-**QR Blackout** delay. The blackout delay is used both before motion starts and
-after motion ends, defaults to 5 seconds, and shows a black screen instead of
-falling back to the selected frame. The MPV QR screen centers the QR and shows
+controller's **Cycle → Idle display** setting offers **QR code**, **Black screen**,
+and **Current frame**. Current frame pauses the selected sequence at the lift's
+current position and follows the sequence's playback span. The **QR Blackout**
+delay in Advanced applies before scheduled movement and after motion ends,
+including in Current frame mode. Set it to zero to show the frame immediately.
+Advanced also includes **QR Info Text**. The MPV QR screen centers the QR and shows
 large rotated countdown numbers on the left and right edges for side viewing.
 The camera PWA expands its top QR status box when tapped.
 
@@ -269,6 +366,8 @@ These are generated while the installation runs and should not be treated as sou
 - `.run/`
 - `__pycache__/`
 - `actuator_state.json`
+- `actuator_state.json.bak`
+- `actuator_position*.json`, `actuator_position*.json.bak`, and `actuator_position*.moving`
 - `*.log`
 - `*.tmp`
 - `experiments/pi_long_exposure/captures/`

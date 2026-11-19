@@ -284,7 +284,7 @@
             const { strokeCm, heightCm } = sequenceSpan(sequence);
             const travelDirection = direction < 0 ? -1 : 1;
             const strokeSec = travelDirection > 0
-                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC)
+                ? Number(state?.extend_sec || DEFAULT_EXTEND_SEC) - Number(state?.playback_deadband_sec || 0)
                 : Number(state?.retract_sec || DEFAULT_RETRACT_SEC);
             const duty = clamp(Number(state?.speed_duty || 1), 0.1, 1);
             const durationSec = ((heightCm / strokeCm) * Math.max(0.01, strokeSec)) / duty;
@@ -544,9 +544,10 @@
         }
 
         function movementDirectionForState(state, positionPct = null) {
-            if (!state || !state.is_moving || state.is_paused) {
+            if (!state || !state.is_moving || state.is_paused || state.motion_pending) {
                 return 0;
             }
+            if (state.motion_direction === 1 || state.motion_direction === -1) return state.motion_direction;
             if (state.switch_direction !== 0) {
                 return state.switch_direction > 0 ? 1 : -1;
             }
@@ -565,7 +566,7 @@
             return 0;
         }
 
-        function estimatedPositionPct() {
+        function estimatedMotorPositionPct() {
             if (!currentState) {
                 return 0;
             }
@@ -582,7 +583,7 @@
             const duty = clamp(Number(currentState.speed_duty || 1), 0.1, 1);
             const elapsedSec = Math.max(0, (performance.now() - lastStateReceivedAtMs) / 1000);
             const estimated = basePct + ((100 / Math.max(0.01, strokeSec)) * duty * direction * elapsedSec);
-            const activeTarget = Number(currentState.active_target_pct);
+            const activeTarget = currentState.active_target_pct == null ? NaN : Number(currentState.active_target_pct);
 
             if (Number.isFinite(activeTarget)) {
                 return direction > 0
@@ -593,8 +594,20 @@
             return clamp(estimated, 0, 100);
         }
 
+        function estimatedPositionPct() {
+            const deadbandPct = Number(currentState?.playback_deadband_sec || 0) * 100
+                / Number(currentState?.extend_sec || DEFAULT_EXTEND_SEC);
+            return clamp((estimatedMotorPositionPct() - deadbandPct) * 100 / (100 - deadbandPct), 0, 100);
+        }
+
+        function inBottomPlaybackDelay() {
+            const deadbandSec = Number(currentState?.playback_deadband_sec || 0);
+            return Boolean(currentState && (currentState.is_moving || currentState.is_paused) && deadbandSec > 0
+                && estimatedMotorPositionPct() < deadbandSec * 100 / Number(currentState.extend_sec || DEFAULT_EXTEND_SEC));
+        }
+
         function shouldAnimateDisplay() {
-            return Boolean(currentState && currentState.is_moving && !currentState.is_paused);
+            return Boolean(currentState && currentState.is_moving && !currentState.is_paused && !currentState.motion_pending);
         }
 
         function renderAnimationFrame() {
@@ -729,6 +742,21 @@
             const displayPositionPct = estimatedPositionPct();
             updateOverlays(displayPositionPct);
 
+            if (currentState?.position_known === false) {
+                qrStandbyImage.style.display = "none";
+                document.body.classList.remove("qr-active");
+                clearCanvas();
+                frameLabel.textContent = "Position unknown";
+                return;
+            }
+            if (inBottomPlaybackDelay()) {
+                qrStandbyImage.style.display = "none";
+                document.body.classList.remove("qr-active");
+                clearCanvas();
+                frameLabel.textContent = "Bottom playback delay";
+                return;
+            }
+
             if (syncQrStandbyImage(currentState)) {
                 clearCanvas();
                 frameLabel.textContent = "Camera QR";
@@ -778,7 +806,7 @@
                 }
 
                 requestImage(imageUrl, (image) => {
-                    if (!currentState || !currentSequence || qrSyncBlocksFrameDisplay(currentState)) {
+                    if (!currentState || !currentSequence || qrSyncBlocksFrameDisplay(currentState) || inBottomPlaybackDelay()) {
                         return;
                     }
                     const latestDirection = movementDirectionForState(currentState, estimatedPositionPct());
@@ -861,6 +889,10 @@
                 return;
             }
             if (qrSyncBlocksFrameDisplay(currentState)) {
+                return;
+            }
+            if (inBottomPlaybackDelay()) {
+                clearCanvas();
                 return;
             }
             if (playbackRatioForPosition(currentSequence, estimatedPositionPct()) == null) {

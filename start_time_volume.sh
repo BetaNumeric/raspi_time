@@ -264,7 +264,8 @@ start_server() {
         fi
     fi
 
-    TIME_VOLUME_AUTO_START_CYCLE=0 nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" --display-backend "$SERVER_DISPLAY_BACKEND" >>"$LOG_FILE" 2>&1 &
+    # Close the launcher lock in long-lived children so later launchers can acquire it.
+    TIME_VOLUME_AUTO_START_CYCLE=0 nohup python3 "$SCRIPT_DIR/actuator_web.py" --host "$HOST" --port "$PORT" --display-backend "$SERVER_DISPLAY_BACKEND" 9>&- >>"$LOG_FILE" 2>&1 &
     echo "$!" > "$PID_FILE"
 }
 
@@ -307,13 +308,13 @@ launch_browser() {
 
     case "$browser" in
         chromium-browser|chromium)
-            "$browser" --new-window --kiosk --app="$DISPLAY_URL" >/dev/null 2>&1 &
+            "$browser" --new-window --kiosk --app="$DISPLAY_URL" 9>&- >/dev/null 2>&1 &
             ;;
         epiphany-browser|epiphany)
-            "$browser" --application-mode "$DISPLAY_URL" >/dev/null 2>&1 &
+            "$browser" --application-mode "$DISPLAY_URL" 9>&- >/dev/null 2>&1 &
             ;;
         firefox)
-            "$browser" --kiosk "$DISPLAY_URL" >/dev/null 2>&1 &
+            "$browser" --kiosk "$DISPLAY_URL" 9>&- >/dev/null 2>&1 &
             ;;
     esac
 

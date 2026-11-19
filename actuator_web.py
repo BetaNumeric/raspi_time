@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import math
 import mimetypes
@@ -13,6 +14,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -26,6 +28,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
 from qr_sync import make_qr_matrix, write_qr_png
+from state_storage import PositionStore, atomic_write, read_json_object
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -72,6 +75,7 @@ SW_ACTIVE_LOW = True
 SW_POLL_MS = 30
 SW_DEBOUNCE_SAMPLES = 2
 JOG_LEASE_SEC = 1.0
+MAX_BOTTOM_DEADBAND_SEC = 5.0
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -84,6 +88,7 @@ CAMERA_APP_DIR = CAMERA_APP_DIR.resolve()
 DEFAULT_CAMERA_URL = "https://betanumeric.github.io/volumetric_time_camera/"
 EXTERNAL_CAMERA_URL = os.environ.get("TIME_VOLUME_CAMERA_URL", DEFAULT_CAMERA_URL).strip()
 STATE_FILE = BASE_DIR / "actuator_state.json"
+POWEROFF_TOKEN_FILE = BASE_DIR / ".shutdown-token"
 DEFAULT_HOST = os.environ.get("ACTUATOR_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("ACTUATOR_PORT", "8000"))
 
@@ -97,6 +102,7 @@ MEDIA_IMPORT_TEMP_SUFFIXES = (".partial", ".tmp", ".incoming", ".copying")
 POSITION_TARGET_EPSILON_PCT = 0.05
 QR_SYNC_DEFAULT_GUARD_SEC = 5.0
 QR_SYNC_SETTINGS_VERSION = 4
+IDLE_DISPLAY_MODES = ("qr", "black", "frame")
 QR_SYNC_COUNTDOWN_QUANTUM_MS = 1000
 QR_SYNC_CAPTURE_START_LEAD_MS = 500
 QR_SYNC_CAPTURE_STOP_PADDING_MS = 750
@@ -191,9 +197,18 @@ def sequence_span_cm(sequence: "SequenceItem") -> tuple[float, float, float]:
     return start_cm, end_cm, end_cm - start_cm
 
 
-def sequence_travel_duration_sec(sequence: "SequenceItem", direction: int, duty: float) -> float:
+def playback_position_for_pct(position_pct: float, bottom_deadband_sec: float = 0.0) -> float:
+    deadband_pct = clamp(bottom_deadband_sec, 0.0, MAX_BOTTOM_DEADBAND_SEC) * 100.0 / EXTEND_SEC
+    return clamp((position_pct - deadband_pct) * 100.0 / (100.0 - deadband_pct), 0.0, 100.0)
+
+
+def sequence_travel_duration_sec(
+    sequence: "SequenceItem", direction: int, duty: float, bottom_deadband_sec: float = 0.0
+) -> float:
     _, _, height_cm = sequence_span_cm(sequence)
     stroke_sec = EXTEND_SEC if direction >= 0 else RETRACT_SEC
+    if direction >= 0:
+        stroke_sec -= clamp(bottom_deadband_sec, 0.0, MAX_BOTTOM_DEADBAND_SEC)
     effective_duty = clamp(duty, 0.1, 1.0)
     return ((height_cm / LIFT_STROKE_CM) * stroke_sec) / effective_duty
 
@@ -205,10 +220,12 @@ def lift_motion_duration_sec(direction: int, duty: float, travel_pct: float = 10
     return max(0.0, (travel_fraction * stroke_sec) / effective_duty)
 
 
-def frame_stride_for_sequence(sequence: "SequenceItem", direction: int, duty: float, fps_cap: float) -> tuple[int, float, float]:
+def frame_stride_for_sequence(
+    sequence: "SequenceItem", direction: int, duty: float, fps_cap: float, bottom_deadband_sec: float = 0.0
+) -> tuple[int, float, float]:
     if sequence.kind != "images" or sequence.frame_count <= 1:
         return 1, 0.0, 0.0
-    duration_sec = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
+    duration_sec = max(0.01, sequence_travel_duration_sec(sequence, direction, duty, bottom_deadband_sec))
     requested_fps = sequence.frame_count / duration_sec
     if fps_cap <= 0:
         return 1, requested_fps, duration_sec
@@ -615,21 +632,37 @@ class MotionSession:
     token: int
     stop_event: threading.Event = field(default_factory=threading.Event)
     lease_deadline: float | None = None
+    started: bool = False
 
 
 class ActuatorHardware:
-    def __init__(self, req: Any):
+    def __init__(self, req: Any, position_store: PositionStore | None = None):
         self.req = req
         self.position_pct = 0.0
         self.is_moving = False
         self.is_paused = False
         self.current_duty = 1.0
+        self.motion_direction = 0
+        self.playback_deadband_sec = 0.0
         self.lock = threading.Lock()
         self.io_lock = threading.Lock()
         self.motion_stop_event = threading.Event()
         self.motion_token = 0
         self.motion_session: MotionSession | None = None
         self.closed = False
+        self.position_store = position_store
+        self.position_known = False
+        self.position_reference = "unknown"
+        self.position_error: str | None = "Home required"
+        self.position_dirty = False
+        if position_store is not None:
+            payload, error = position_store.load()
+            if payload is not None:
+                self.position_pct = payload["position_pct"]
+                self.playback_deadband_sec = payload["playback_deadband_sec"]
+            self.position_known = error is None
+            self.position_reference = "restored" if self.position_known else "unknown"
+            self.position_error = error
 
     def _set_line_value(self, line: int, value: Any, ignore_errors: bool = False) -> None:
         if not self.req or gpiod is None:
@@ -648,7 +681,7 @@ class ActuatorHardware:
         with self.io_lock:
             return self.req.get_value(line)
 
-    def _disable_outputs(self, ignore_errors: bool = False) -> None:
+    def _disable_outputs(self, ignore_errors: bool = False) -> bool:
         # One broken GPIO must not prevent the remaining outputs being disabled.
         error = None
         if self.req and gpiod is not None:
@@ -660,23 +693,67 @@ class ActuatorHardware:
                         error = exc
         if error is not None and not ignore_errors:
             raise error
+        return error is None
 
-    def reserve_motion(self, clear_paused: bool = False, lease_timeout: float | None = None) -> MotionSession | None:
+    def _checkpoint_stopped(self) -> None:
+        # Caller owns lock and has already disabled every motor output.
+        if not self.position_dirty or self.position_store is None:
+            return
+        try:
+            self.position_store.save_stopped(self.position_pct, self.position_known, self.playback_deadband_sec)
+        except Exception as exc:
+            self.position_known = False
+            self.position_reference = "unknown"
+            self.position_error = f"Could not save position: {exc}; Home required"
+            print(f"Warning: {self.position_error}")
+        else:
+            self.position_dirty = False
+
+    def _outputs_stopped(self, ignore_errors: bool = False) -> None:
+        try:
+            self._disable_outputs()
+        except Exception:
+            self.position_known = False
+            self.position_reference = "unknown"
+            self.position_error = "Could not disable all motor outputs; Home required"
+            if not ignore_errors:
+                raise
+            return
+        self._checkpoint_stopped()
+
+    def reserve_motion(
+        self, clear_paused: bool = False, lease_timeout: float | None = None,
+        *, direction: int = 0, bottom_deadband_sec: float = 0.0,
+        automatic: bool = False,
+    ) -> MotionSession | None:
         # Reserve before launching a worker. Stop can then cancel even work that
         # has not reached its first instruction. Lock order is lock -> io_lock.
         with self.lock:
             if self.closed:
                 return None
+            if automatic and not self.position_known:
+                raise PositionUnknownError("Position unknown; complete Home before automatic movement")
             self.motion_stop_event.set()
             self.motion_token += 1
             self.is_moving = False
-            self._disable_outputs()
+            try:
+                self._disable_outputs()
+            except Exception:
+                self.position_known = False
+                self.position_reference = "unknown"
+                self.position_error = "Motor output error; Home required"
+                raise
             session = MotionSession(
                 self.motion_token,
                 lease_deadline=time.monotonic() + lease_timeout if lease_timeout is not None else None,
             )
             self.motion_session = session
             self.motion_stop_event = session.stop_event
+            if direction < 0:
+                self.playback_deadband_sec = 0.0
+            elif direction > 0 and self.position_pct <= POSITION_TARGET_EPSILON_PCT:
+                self.playback_deadband_sec = clamp(bottom_deadband_sec, 0.0, MAX_BOTTOM_DEADBAND_SEC)
+            self.motion_direction = direction
             self.is_moving = True
             if clear_paused:
                 self.is_paused = False
@@ -708,7 +785,16 @@ class ActuatorHardware:
             if homed and self._session_is_current(session):
                 self.position_pct = 0.0
             self.is_moving = False
-            self._disable_outputs(ignore_errors=True)
+            if not self._disable_outputs(ignore_errors=True):
+                self.position_known = False
+                self.position_reference = "unknown"
+                self.position_error = "Could not disable all motor outputs; Home required"
+                return
+            if homed and self._session_is_current(session):
+                self.position_known = True
+                self.position_reference = "homed"
+                self.position_error = None
+            self._checkpoint_stopped()
 
     def enable(self, on: bool = True, ignore_errors: bool = False) -> None:
         if not self.req or gpiod is None:
@@ -722,7 +808,7 @@ class ActuatorHardware:
             self.motion_stop_event.set()
             self.motion_token += 1
             self.is_moving = False
-            self._disable_outputs(ignore_errors=ignore_errors)
+            self._outputs_stopped(ignore_errors=ignore_errors)
 
     def close(self) -> None:
         with self.lock:
@@ -730,7 +816,7 @@ class ActuatorHardware:
             self.motion_stop_event.set()
             self.motion_token += 1
             self.is_moving = False
-            self._disable_outputs(ignore_errors=True)
+            self._outputs_stopped(ignore_errors=True)
 
     def pause(self) -> None:
         with self.lock:
@@ -763,10 +849,20 @@ class ActuatorHardware:
             with self.lock:
                 if not self._session_is_current(session):
                     return False
+                if self.position_store is not None:
+                    self.position_store.begin_motion()
+                    self.position_dirty = True
+                    if not self._session_is_current(session):
+                        return False
                 if self.req and gpiod is not None:
                     other_pin = LPWM if pin == RPWM else RPWM
                     self._set_line_value(other_pin, gpiod.line.Value.INACTIVE)
                 self.enable(True)
+                # Durable writes can take time. Count only motor running time,
+                # excluding the checkpoint/dirty-marker sync above.
+                start_time = time.monotonic()
+                last_tick = start_time
+                session.started = True
 
             while time.monotonic() - start_time < duration:
                 with self.lock:
@@ -796,6 +892,13 @@ class ActuatorHardware:
             with self.lock:
                 completed = self._session_is_current(session)
                 return completed
+        except Exception as exc:
+            with self.lock:
+                if self.motion_session is session and self.motion_token == session.token:
+                    self.position_known = False
+                    self.position_reference = "unknown"
+                    self.position_error = f"Movement failed: {exc}; Home required"
+            raise
         finally:
             self._finish_motion_session(session, homed=home_on_completion and completed)
 
@@ -850,16 +953,49 @@ class ActuatorHardware:
         self._soft_pwm_loop(pin, duty, 3600.0, update_position, session=session)
 
     def home(self, *, session: MotionSession) -> None:
+        with self.lock:
+            if self._session_is_current(session):
+                self.position_known = False
+                self.position_reference = "unknown"
+                self.position_error = "Homing in progress; complete Home to establish position"
         self._soft_pwm_loop(LPWM, 1.0, HOME_TIMEOUT_SEC, session=session, full_speed=True, home_on_completion=True)
+
+    def mark_home(self) -> None:
+        with self.lock:
+            if self.is_moving or self.closed:
+                raise HomeConflictError("Stop movement before marking the lift as home")
+            self._disable_outputs()
+            if self.position_store is not None:
+                self.position_store.save_stopped(0.0, True, 0.0)
+
+            self.motion_stop_event.set()
+            self.motion_token += 1
+            self.is_paused = False
+            self.motion_direction = 0
+            self.playback_deadband_sec = 0.0
+            self.position_pct = 0.0
+            self.position_known = True
+            self.position_reference = "manual_home"
+            self.position_error = None
+            self.position_dirty = False
 
 
 class JogConflictError(ValueError):
     pass
 
 
+class PositionUnknownError(RuntimeError):
+    pass
+
+
+class HomeConflictError(RuntimeError):
+    pass
+
+
 class InstallationController:
     def __init__(self, req: Any, mpv_bin: str = "mpv", mpv_fps_cap: float = MPV_DEFAULT_FPS_CAP):
-        self.hardware = ActuatorHardware(req)
+        position_name = "actuator_position.json" if req is not None else "actuator_position.simulation.json"
+        self.hardware = ActuatorHardware(req, PositionStore(STATE_FILE.with_name(position_name)))
         if req:
             self.hardware.enable(False)
             self.hardware.stop_pwm()
@@ -880,6 +1016,7 @@ class InstallationController:
         self.target_pct = 0.0
         self.delay_sec = 0
         self.speed_duty = 1.0
+        self.bottom_deadband_sec = 0.0
         self.cycle_pause_extend_sec = 60.0
         self.cycle_pause_retract_sec = 60.0
         self.cycle_random = False
@@ -903,7 +1040,7 @@ class InstallationController:
         self.cycle_pending_direction: int | None = None
         self.last_cycle_end_reason: str | None = None
         self.last_runtime_error: str | None = None
-        self.qr_sync_enabled = True
+        self.idle_display_mode = "qr"
         self.qr_sync_debug_enabled = False
         self.qr_sync_upcoming_count = QR_SYNC_DEFAULT_UPCOMING_COUNT
         self.qr_sync_name_count = QR_SYNC_DEFAULT_NAME_COUNT
@@ -933,18 +1070,22 @@ class InstallationController:
         self.switch_thread.start()
 
     def _load_settings(self) -> None:
-        if not STATE_FILE.exists():
-            return
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
+        data = None
+        for path in (STATE_FILE, STATE_FILE.with_suffix(".json.bak")):
+            try:
+                data = read_json_object(path)
+                break
+            except (OSError, ValueError):
+                continue
+        if data is None:
             return
 
-        self.target_pct = clamp(float(data.get("target_pct", self.target_pct)), 0.0, 100.0)
-        self.delay_sec = max(0, int(data.get("delay_sec", self.delay_sec)))
-        self.speed_duty = clamp(float(data.get("speed_duty", self.speed_duty)), 0.1, 1.0)
-        self.cycle_pause_extend_sec = max(0.0, float(data.get("cycle_pause_extend_sec", self.cycle_pause_extend_sec)))
-        self.cycle_pause_retract_sec = max(0.0, float(data.get("cycle_pause_retract_sec", self.cycle_pause_retract_sec)))
+        self.target_pct = clamp(coerce_float(data.get("target_pct"), self.target_pct), 0.0, 100.0)
+        self.delay_sec = max(0, int(coerce_float(data.get("delay_sec"), self.delay_sec)))
+        self.speed_duty = clamp(coerce_float(data.get("speed_duty"), self.speed_duty), 0.1, 1.0)
+        self.bottom_deadband_sec = clamp(coerce_float(data.get("bottom_deadband_sec"), 0.0), 0.0, MAX_BOTTOM_DEADBAND_SEC)
+        self.cycle_pause_extend_sec = max(0.0, coerce_float(data.get("cycle_pause_extend_sec"), self.cycle_pause_extend_sec))
+        self.cycle_pause_retract_sec = max(0.0, coerce_float(data.get("cycle_pause_retract_sec"), self.cycle_pause_retract_sec))
         self.cycle_random = False
         cycle_order_ids = data.get("cycle_order_ids")
         if isinstance(cycle_order_ids, list):
@@ -953,7 +1094,11 @@ class InstallationController:
         if isinstance(cycle_disabled_ids, list):
             self.cycle_disabled_ids = {str(item) for item in cycle_disabled_ids if isinstance(item, str) and item}
         qr_settings_version = int(coerce_float(data.get("qr_sync_settings_version"), 0))
-        self.qr_sync_enabled = bool(data.get("qr_sync_enabled", self.qr_sync_enabled))
+        idle_mode = data.get("idle_display_mode")
+        self.idle_display_mode = (
+            idle_mode if idle_mode in IDLE_DISPLAY_MODES
+            else ("qr" if data.get("qr_sync_enabled", True) else "black")
+        )
         if qr_settings_version < QR_SYNC_SETTINGS_VERSION:
             self.qr_sync_debug_enabled = False
         else:
@@ -982,13 +1127,15 @@ class InstallationController:
                 "target_pct": round(self.target_pct, 2),
                 "delay_sec": self.delay_sec,
                 "speed_duty": round(self.speed_duty, 3),
+                "bottom_deadband_sec": round(self.bottom_deadband_sec, 3),
                 "cycle_pause_extend_sec": round(self.cycle_pause_extend_sec, 2),
                 "cycle_pause_retract_sec": round(self.cycle_pause_retract_sec, 2),
                 "cycle_random": self.cycle_random,
                 "cycle_order_ids": [],
                 "cycle_disabled_ids": [],
                 "selected_sequence_id": self.selected_sequence_id,
-                "qr_sync_enabled": self.qr_sync_enabled,
+                "idle_display_mode": self.idle_display_mode,
+                "qr_sync_enabled": self.idle_display_mode == "qr",
                 "qr_sync_debug_enabled": self.qr_sync_debug_enabled,
                 "qr_sync_upcoming_count": self.qr_sync_upcoming_count,
                 "qr_sync_name_count": self.qr_sync_name_count,
@@ -999,26 +1146,18 @@ class InstallationController:
         normalized_order = self._normalize_cycle_order_ids(cycle_order_ids)
         payload["cycle_order_ids"] = normalized_order
         payload["cycle_disabled_ids"] = self._normalize_cycle_disabled_ids(cycle_disabled_ids, normalized_order)
-        temp_path = STATE_FILE.with_suffix(".tmp")
-        body = json.dumps(payload, indent=2)
+        body = json.dumps(payload, indent=2, allow_nan=False).encode("utf-8")
         with self.settings_io_lock:
             try:
-                temp_path.write_text(body, encoding="utf-8")
-                temp_path.replace(STATE_FILE)
-                return
-            except Exception as exc:
-                print(f"Warning: atomic state save failed ({exc}). Falling back to direct write.")
                 try:
-                    STATE_FILE.write_text(body, encoding="utf-8")
-                    return
-                except Exception as fallback_exc:
-                    print(f"Warning: state save failed ({fallback_exc}). Continuing without persistence.")
-                finally:
-                    try:
-                        if temp_path.exists():
-                            temp_path.unlink()
-                    except Exception:
-                        pass
+                    read_json_object(STATE_FILE)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    atomic_write(STATE_FILE.with_suffix(".json.bak"), STATE_FILE.read_bytes())
+                atomic_write(STATE_FILE, body)
+            except Exception as exc:
+                print(f"Warning: could not durably save settings: {exc}")
 
     def _flush_scheduled_settings_save(self) -> None:
         with self.settings_timer_lock:
@@ -1161,8 +1300,10 @@ class InstallationController:
                 self.mpv_display = None
 
     def toggle_qr_sync_display(self) -> None:
-        with self.state_lock:
-            self.qr_sync_enabled = not self.qr_sync_enabled
+        with self.command_lock:
+            with self.state_lock:
+                self.idle_display_mode = "black" if self.idle_display_mode == "qr" else "qr"
+            self._schedule_settings_save()
 
     def _pick_advanced_sequence_id(self, step: int = 1, randomize: bool = False) -> str | None:
         ordered = self._enabled_cycle_order_ids()
@@ -1282,7 +1423,7 @@ class InstallationController:
         return 100.0 if direction in {-1, 1} else 0.0
 
     def _qr_sync_motion_duration_ms(self, state: dict[str, Any], direction: int) -> int | None:
-        if direction not in {-1, 1}:
+        if direction not in {-1, 1} or state.get("position_known") is False:
             return None
         duty = float(state.get("speed_duty") or 1.0)
         travel_pct = self._qr_sync_motion_travel_pct(state, direction)
@@ -1390,20 +1531,31 @@ class InstallationController:
         payload_start_in_ms = self._qr_sync_payload_start_in_ms(start_in_ms)
 
         standby_clear = not bool(state.get("is_moving")) and int(state.get("switch_direction") or 0) == 0
-        qr_enabled = bool(state.get("qr_sync_enabled", True))
+        idle_mode = state.get("idle_display_mode", "qr" if state.get("qr_sync_enabled", True) else "black")
         blackout_reason = self._qr_sync_blackout_reason(state, start_in_ms, payload_start_in_ms)
         timing_blackout = blackout_reason in {"before_start", "after_motion"}
         display_mode = "normal"
-        if bool(camera_url) and standby_clear:
-            if not qr_enabled:
+        if standby_clear:
+            if idle_mode == "black":
                 display_mode = "black"
                 blackout_reason = "disabled"
-            elif blackout_reason:
+            elif timing_blackout and (camera_url or idle_mode == "frame"):
                 display_mode = "black"
-            else:
+            elif idle_mode == "qr" and camera_url:
                 display_mode = "qr"
         display_active = display_mode == "qr"
         standby_blackout = display_mode == "black"
+
+        if state.get("position_known") is False:
+            display_mode = "black"
+            display_active = False
+            standby_blackout = True
+            blackout_reason = "position_unknown"
+        elif state.get("motion_pending"):
+            display_mode = "black"
+            display_active = False
+            standby_blackout = True
+            blackout_reason = "preparing_motion"
 
         payload: dict[str, Any] | None = None
         sync_url = camera_url
@@ -1445,7 +1597,7 @@ class InstallationController:
             "qr_sync_url": sync_url,
             "qr_sync_hash": sync_hash,
             "qr_sync_label": label,
-            "qr_sync_enabled": qr_enabled,
+            "qr_sync_enabled": idle_mode == "qr",
             "qr_sync_debug_enabled": bool(state.get("qr_sync_debug_enabled", False)),
             "qr_sync_auto_active": display_active,
             "qr_sync_standby_blackout": standby_blackout,
@@ -1558,9 +1710,22 @@ class InstallationController:
 
     def get_state(self) -> dict[str, Any]:
         with self.hardware.lock:
-            position_pct = round(self.hardware.position_pct, 2)
+            raw_position_pct = self.hardware.position_pct
+            position_pct = round(raw_position_pct, 2)
             is_moving = self.hardware.is_moving
             is_paused = self.hardware.is_paused
+            last_motion_direction = self.hardware.motion_direction
+            motion_direction = last_motion_direction if is_moving else 0
+            playback_deadband_sec = self.hardware.playback_deadband_sec
+            position_known = self.hardware.position_known
+            position_reference = self.hardware.position_reference
+            position_error = self.hardware.position_error
+            motion_pending = is_moving and self.hardware.motion_session is not None and not self.hardware.motion_session.started
+        playback_position_pct = playback_position_for_pct(raw_position_pct, playback_deadband_sec)
+        playback_deadband_active = (
+            (is_moving or is_paused) and playback_deadband_sec > 0
+            and raw_position_pct < playback_deadband_sec * 100.0 / EXTEND_SEC
+        )
 
         with self.state_lock:
             countdown_deadline = self.countdown_deadline
@@ -1568,6 +1733,7 @@ class InstallationController:
             selected_sequence_id = self.selected_sequence_id
             target_pct = round(self.target_pct, 2)
             speed_duty = round(self.speed_duty, 3)
+            bottom_deadband_sec = self.bottom_deadband_sec
             delay_sec = self.delay_sec
             cycle_pause_extend_sec = round(self.cycle_pause_extend_sec, 2)
             cycle_pause_retract_sec = round(self.cycle_pause_retract_sec, 2)
@@ -1582,7 +1748,7 @@ class InstallationController:
             cycle_pending_direction = self.cycle_pending_direction
             last_cycle_end_reason = self.last_cycle_end_reason
             last_runtime_error = self.last_runtime_error
-            qr_sync_enabled = self.qr_sync_enabled
+            idle_display_mode = self.idle_display_mode
             qr_sync_debug_enabled = self.qr_sync_debug_enabled
             qr_sync_upcoming_count = self.qr_sync_upcoming_count
             qr_sync_name_count = self.qr_sync_name_count
@@ -1638,8 +1804,18 @@ class InstallationController:
             "cycle_pending_direction": cycle_pending_direction,
             "last_cycle_end_reason": last_cycle_end_reason,
             "position_pct": position_pct,
+            "position_known": position_known,
+            "position_reference": position_reference,
+            "position_error": position_error,
+            "motion_pending": motion_pending,
             "target_pct": target_pct,
             "speed_duty": speed_duty,
+            "bottom_deadband_sec": bottom_deadband_sec,
+            "playback_deadband_sec": playback_deadband_sec,
+            "playback_deadband_active": playback_deadband_active,
+            "playback_position_pct": playback_position_pct,
+            "motion_direction": motion_direction,
+            "last_motion_direction": last_motion_direction,
             "delay_sec": delay_sec,
             "cycle_pause_extend_sec": cycle_pause_extend_sec,
             "cycle_pause_retract_sec": cycle_pause_retract_sec,
@@ -1676,7 +1852,7 @@ class InstallationController:
             "lift_stroke_cm": LIFT_STROKE_CM,
             "extend_sec": EXTEND_SEC,
             "retract_sec": RETRACT_SEC,
-            "frame_index": sequence.frame_index_for_pct(position_pct) if sequence else 0,
+            "frame_index": None if playback_deadband_active or not position_known else (sequence.frame_index_for_pct(playback_position_pct) if sequence else 0),
             "is_simulation": self.hardware.req is None,
             "media_root": str(MEDIA_ROOT),
             "controller_url": "/controller",
@@ -1685,7 +1861,7 @@ class InstallationController:
             "display_backend_status": display_backend_status,
             "mpv_fps_cap": self.mpv_fps_cap,
             "camera_url": configured_camera_url(),
-            "qr_sync_enabled": qr_sync_enabled,
+            "idle_display_mode": idle_display_mode,
             "qr_sync_debug_enabled": qr_sync_debug_enabled,
             "qr_sync_upcoming_count": qr_sync_upcoming_count,
             "qr_sync_name_count": qr_sync_name_count,
@@ -1697,6 +1873,8 @@ class InstallationController:
         return state
 
     def set_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "idle_display_mode" in payload and payload["idle_display_mode"] not in IDLE_DISPLAY_MODES:
+            raise ValueError("idle_display_mode must be qr, black, or frame")
         restart_target = None
         with self.command_lock:
             with self.state_lock:
@@ -1708,6 +1886,11 @@ class InstallationController:
                 if "speed_duty" in payload:
                     self.speed_duty = clamp(float(payload["speed_duty"]), 0.1, 1.0)
                     self.hardware.current_duty = self.speed_duty
+                if "bottom_deadband_sec" in payload:
+                    deadband = float(payload["bottom_deadband_sec"])
+                    if not math.isfinite(deadband) or not 0.0 <= deadband <= MAX_BOTTOM_DEADBAND_SEC:
+                        raise ValueError(f"bottom_deadband_sec must be between 0 and {MAX_BOTTOM_DEADBAND_SEC:g}")
+                    self.bottom_deadband_sec = deadband
                 if "cycle_pause_extend_sec" in payload:
                     self.cycle_pause_extend_sec = max(0.0, float(payload["cycle_pause_extend_sec"]))
                 if "cycle_pause_retract_sec" in payload:
@@ -1732,8 +1915,10 @@ class InstallationController:
                     self.cycle_disabled_ids = set(
                         self._normalize_cycle_disabled_ids(requested_disabled, self.cycle_order_ids)
                     )
-                if "qr_sync_enabled" in payload:
-                    self.qr_sync_enabled = bool(payload["qr_sync_enabled"])
+                if "idle_display_mode" in payload:
+                    self.idle_display_mode = payload["idle_display_mode"]
+                elif "qr_sync_enabled" in payload:
+                    self.idle_display_mode = "qr" if payload["qr_sync_enabled"] else "black"
                 if "qr_sync_debug_enabled" in payload:
                     self.qr_sync_debug_enabled = bool(payload["qr_sync_debug_enabled"])
                 if "qr_sync_upcoming_count" in payload:
@@ -1782,11 +1967,22 @@ class InstallationController:
         self.jog_session_id = None
         self.jog_motion = None
 
-    def _reserve_motion(self, lease_timeout: float | None = None) -> MotionSession | None:
+    def _reserve_motion(
+        self, lease_timeout: float | None = None, *, direction: int = 0, automatic: bool = False
+    ) -> MotionSession | None:
         if self.shutdown_event.is_set():
             return None
         self._invalidate_jog()
-        return self.hardware.reserve_motion(clear_paused=True, lease_timeout=lease_timeout)
+        return self.hardware.reserve_motion(
+            clear_paused=True, lease_timeout=lease_timeout,
+            direction=direction, bottom_deadband_sec=self.bottom_deadband_sec,
+            automatic=automatic,
+        )
+
+    def _require_position(self) -> None:
+        with self.hardware.lock:
+            if not self.hardware.position_known:
+                raise PositionUnknownError("Position unknown; complete Home before automatic movement")
 
     def _launch_motion_worker(self, target: Any, args: tuple[Any, ...], session: MotionSession) -> None:
         try:
@@ -1830,6 +2026,11 @@ class InstallationController:
         with self.command_lock:
             if self.shutdown_event.is_set():
                 return
+            try:
+                self._require_position()
+            except PositionUnknownError as exc:
+                self._set_runtime_error(str(exc))
+                return
             delay_seconds = max(0.0, float(seconds))
             if remember_delay:
                 with self.state_lock:
@@ -1847,6 +2048,7 @@ class InstallationController:
         with self.command_lock:
             if self.shutdown_event.is_set():
                 return
+            self._require_position()
             self.cancel_countdown()
             if seconds <= 0:
                 if action == "cycle":
@@ -1959,6 +2161,7 @@ class InstallationController:
         with self.command_lock:
             if self.is_switch_override_active() or self.shutdown_event.is_set():
                 return
+            self._require_position()
 
             with self.state_lock:
                 target = self.target_pct
@@ -1975,7 +2178,7 @@ class InstallationController:
                     self.active_target = None
                 return
 
-            session = self._reserve_motion()
+            session = self._reserve_motion(direction=1 if delta > 0 else -1, automatic=True)
             if session is not None:
                 token = self._begin_target_movement(target)
                 self._launch_motion_worker(self._move_worker, (delta, duty, token), session)
@@ -1994,6 +2197,7 @@ class InstallationController:
                     self.active_target = None
                 return
 
+            self._require_position()
             self.hardware.stop_pwm()
             time.sleep(0.1)
 
@@ -2010,7 +2214,7 @@ class InstallationController:
                 self.last_cycle_end_reason = None
                 self.last_runtime_error = None
 
-            session = self._reserve_motion()
+            session = self._reserve_motion(direction=1 if delta > 0 else -1, automatic=True)
             if session is not None:
                 token = self._begin_target_movement(new_target)
                 self._launch_motion_worker(self._move_worker, (delta, duty, token), session)
@@ -2078,6 +2282,7 @@ class InstallationController:
     def _start_cycle_now_locked(self) -> None:
         if self.is_switch_override_active() or self.shutdown_event.is_set():
             return
+        self._require_position()
         with self.hardware.lock:
             if self.hardware.is_moving:
                 return
@@ -2181,6 +2386,7 @@ class InstallationController:
 
     def _cycle_move_to_target(self, target_pct: float, duty: float, cycle_token: int) -> bool:
         while not self.shutdown_event.is_set():
+            self._require_position()
             with self.state_lock:
                 if cycle_token != self.cycle_token or not self.is_cycling:
                     return False
@@ -2200,7 +2406,8 @@ class InstallationController:
                 with self.state_lock:
                     if cycle_token != self.cycle_token or not self.is_cycling or self.is_cycle_paused:
                         continue
-                session = self._reserve_motion()
+                self._require_position()
+                session = self._reserve_motion(direction=1 if delta > 0 else -1, automatic=True)
                 if session is None:
                     return False
                 token = self._begin_target_movement(target_pct)
@@ -2317,7 +2524,7 @@ class InstallationController:
             with self.state_lock:
                 self.last_cycle_end_reason = None
                 self.last_runtime_error = None
-            session = self._reserve_motion(lease_timeout=JOG_LEASE_SEC)
+            session = self._reserve_motion(lease_timeout=JOG_LEASE_SEC, direction=direction)
             if session is None:
                 raise JogConflictError("Controller is shutting down")
             self.jog_session_id = session_id
@@ -2357,9 +2564,29 @@ class InstallationController:
             with self.state_lock:
                 self.last_cycle_end_reason = None
                 self.last_runtime_error = None
-            session = self._reserve_motion()
+            session = self._reserve_motion(direction=-1)
             if session is not None:
                 self._launch_motion_worker(self._home_worker, (), session)
+
+    def mark_home(self) -> None:
+        with self.command_lock:
+            if self.shutdown_event.is_set():
+                raise HomeConflictError("The controller is shutting down")
+            with self.state_lock:
+                if self.is_cycling or self.countdown_deadline is not None:
+                    raise HomeConflictError("Stop the cycle or countdown before marking the lift as home")
+            if self.is_switch_override_active() or self.read_toggle_switch_direction() != 0:
+                raise HomeConflictError("Set the physical switch to off before marking the lift as home")
+
+            self.hardware.mark_home()
+            # Also invalidate a countdown that expired while waiting for the command lock.
+            self.cancel_countdown()
+            self._invalidate_jog()
+            with self.state_lock:
+                self.movement_token += 1
+                self.active_target = None
+                self.last_cycle_end_reason = None
+                self.last_runtime_error = None
 
     def stop_all(self) -> None:
         with self.command_lock:
@@ -2411,7 +2638,7 @@ class InstallationController:
             with self.state_lock:
                 self.active_target = None
                 self.last_runtime_error = None
-            session = self._reserve_motion()
+            session = self._reserve_motion(direction=direction)
             if session is not None:
                 self._launch_motion_worker(self._manual_move_worker, (direction, self.speed_duty, "switch"), session)
 
@@ -2462,11 +2689,49 @@ class InstallationController:
             self._cancel_scheduled_settings_save()
             self._save_settings()
 
+    def request_poweroff(self) -> None:
+        with self.command_lock:
+            if self.shutdown_event.is_set():
+                raise RuntimeError("Shutdown is already in progress")
+            if self.hardware.req is None:
+                raise RuntimeError("Pi shutdown is unavailable in simulation")
+
+            # The command lock prevents the physical switch, a cycle or another
+            # request from starting motion between Stop and the OS request.
+            self.stop_all()
+            try:
+                subprocess.run(
+                    ["/usr/bin/sudo", "-n", "--", "/usr/bin/systemctl", "poweroff"],
+                    check=True, timeout=10, capture_output=True,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"Could not confirm OS shutdown: {exc}", flush=True)
+                raise RuntimeError("Could not confirm Pi shutdown. Check the Pi and the controller's shutdown permission.") from exc
+            self.shutdown_event.set()
+
+
+def load_poweroff_token(path: Path) -> str | None:
+    try:
+        mode = path.stat().st_mode
+        if not stat.S_ISREG(mode) or mode & 0o077:
+            raise ValueError("the token file must be private (chmod 600)")
+        with path.open(encoding="ascii") as stream:
+            token = stream.read(256).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            raise ValueError("generate the token with secrets.token_urlsafe(32)")
+        return token
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        print(f"Controller shutdown disabled: {exc}", flush=True)
+        return None
+
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
     request_queue_size = 32
+    poweroff_token: str | None = None
 
 
 class ActuatorRequestHandler(BaseHTTPRequestHandler):
@@ -2488,6 +2753,9 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/action":
             self._handle_action_post()
+            return
+        if parsed.path == "/api/poweroff":
+            self._handle_poweroff_post()
             return
         if parsed.path == "/api/pi-camera/record":
             self._handle_pi_camera_record_post()
@@ -2612,6 +2880,10 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
                 controller.stop_mpv_display()
             elif action == "home":
                 controller.home()
+            elif action == "mark_home":
+                if payload.get("confirmed_at_bottom") is not True:
+                    raise ValueError("Confirm that the lift is fully lowered")
+                controller.mark_home()
             elif action == "cycle_toggle":
                 controller.toggle_cycle()
             elif action == "cycle_start_countdown":
@@ -2639,7 +2911,7 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json_error(HTTPStatus.BAD_REQUEST, "Unknown action")
                 return
-        except JogConflictError as exc:
+        except (JogConflictError, PositionUnknownError, HomeConflictError) as exc:
             self._json_error(HTTPStatus.CONFLICT, str(exc))
             return
         except (TypeError, ValueError) as exc:
@@ -2650,6 +2922,44 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"state": self._controller_state()})
+
+    def _poweroff_over_https(self) -> bool:
+        return (
+            self.client_address[0] in {"127.0.0.1", "::1"}
+            and self.headers.get_all("X-Forwarded-Proto") == ["https"]
+        )
+
+    def _handle_poweroff_post(self) -> None:
+        # Close after the reply, including when rejecting an unread body.
+        self.close_connection = True
+        token = getattr(self.server, "poweroff_token", None)
+        if token is None:
+            self._json_error(HTTPStatus.NOT_FOUND, "Controller shutdown is disabled")
+            return
+        if not self._poweroff_over_https():
+            self._json_error(HTTPStatus.FORBIDDEN, "Open the controller over HTTPS to shut down the Pi")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 1024 or self.headers.get_content_type() != "application/json":
+                raise ValueError("Expected a short JSON request")
+            payload = self._read_json_body()
+        except (OSError, ValueError):
+            self._json_error(HTTPStatus.BAD_REQUEST, "Invalid shutdown request")
+            return
+        supplied = payload.get("token")
+        if not isinstance(supplied, str) or not supplied.isascii() or not hmac.compare_digest(token, supplied):
+            self._json_error(HTTPStatus.FORBIDDEN, "Incorrect shutdown key")
+            return
+        if payload.get("confirmed") is not True:
+            self._json_error(HTTPStatus.BAD_REQUEST, "Confirm that you want to shut down the Pi")
+            return
+        try:
+            self._require_controller().request_poweroff()
+        except (RuntimeError, OSError) as exc:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+            return
+        self._send_json({"accepted": True}, HTTPStatus.ACCEPTED)
 
     def _handle_pi_camera_record_post(self) -> None:
         runtime = self.pi_camera
@@ -2692,6 +3002,9 @@ class ActuatorRequestHandler(BaseHTTPRequestHandler):
 
     def _with_pi_camera_state(self, state: dict[str, Any]) -> dict[str, Any]:
         state["pi_camera"] = self._pi_camera_state()
+        if getattr(getattr(self, "server", None), "poweroff_token", None) and not state.get("is_simulation"):
+            state["poweroff_available"] = self._poweroff_over_https()
+            state["poweroff_configured"] = True
         return state
 
     def _pi_camera_state(self) -> dict[str, Any]:
@@ -3269,6 +3582,9 @@ class MpvDisplayBackend:
             self._show_qr_debug_text(state)
 
     def _direction_for_state(self, state: dict[str, Any]) -> int:
+        if state.get("motion_direction") in (-1, 1):
+            self.last_direction = int(state["motion_direction"])
+            return self.last_direction
         switch_direction = int(state.get("switch_direction") or 0)
         if switch_direction:
             self.last_direction = 1 if switch_direction > 0 else -1
@@ -3284,7 +3600,9 @@ class MpvDisplayBackend:
 
     def _image_plan(self, sequence: SequenceItem, state: dict[str, Any], direction: int) -> dict[str, Any]:
         duty = float(state.get("speed_duty") or 1.0)
-        stride, requested_fps, duration_sec = frame_stride_for_sequence(sequence, direction, duty, self.fps_cap)
+        stride, requested_fps, duration_sec = frame_stride_for_sequence(
+            sequence, direction, duty, self.fps_cap, float(state.get("playback_deadband_sec") or 0.0)
+        )
         last_index = max(0, sequence.frame_count - 1)
         indexes = list(range(0, last_index + 1, stride))
         if indexes[-1] != last_index:
@@ -3406,7 +3724,9 @@ class MpvDisplayBackend:
             return
 
         duty = float(state.get("speed_duty") or 1.0)
-        travel_duration = max(0.01, sequence_travel_duration_sec(sequence, direction, duty))
+        travel_duration = max(0.01, sequence_travel_duration_sec(
+            sequence, direction, duty, float(state.get("playback_deadband_sec") or 0.0)
+        ))
         playback_ratio = ratio if direction >= 0 else 1.0 - ratio
         target_time = clamp(playback_ratio, 0.0, 1.0) * duration
 
@@ -3422,6 +3742,9 @@ class MpvDisplayBackend:
 
     def _sync_state(self) -> None:
         state = self.controller.get_state()
+        if state.get("position_known") is False or state.get("playback_deadband_active"):
+            self._load_black()
+            return
         display_mode = state.get("qr_sync_display_mode")
         if display_mode == "qr" or (display_mode is None and state.get("qr_sync_display_active")):
             self._load_qr_sync(state)
@@ -3435,9 +3758,13 @@ class MpvDisplayBackend:
             self._load_black()
             return
 
-        position_pct = float(state.get("position_pct") or 0.0)
-        direction = self._direction_for_state(state)
+        position_pct = float(state.get("playback_position_pct", state.get("position_pct")) or 0.0)
         moving = bool(state.get("is_moving")) and not bool(state.get("is_paused"))
+        if not moving and state.get("idle_display_mode") == "frame":
+            # Preserve the video mapping from the move that just ended.
+            direction = state.get("last_motion_direction") or 1
+        else:
+            direction = self._direction_for_state(state)
         lower_grace_cm = 0.0
         upper_grace_cm = 0.0
         if moving and sequence.kind == "images":
@@ -3611,6 +3938,7 @@ def main() -> None:
         # polling, or replacing the running installation's display process.
         server = ReusableThreadingHTTPServer((args.host, args.port), ActuatorRequestHandler)
         server.timeout = 0.2
+        server.poweroff_token = load_poweroff_token(POWEROFF_TOKEN_FILE)
         if shutdown_requested:
             return
 
@@ -3636,7 +3964,10 @@ def main() -> None:
 
         if AUTO_START_CYCLE_ON_BOOT and not shutdown_requested:
             controller.start_cycle_countdown(AUTO_START_CYCLE_DELAY_SEC, remember_delay=True)
-            print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
+            if controller.is_counting_down():
+                print(f"Auto-start cycle enabled; cycle will start in {AUTO_START_CYCLE_DELAY_SEC:.0f}s.")
+            else:
+                print("Auto-start cycle did not start; check controller status (Home may be required).")
 
         print_launch_hints(args.host, args.port)
         # handle_request() respects timeout, so the main thread can observe a
